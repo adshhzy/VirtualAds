@@ -1,0 +1,25 @@
+# Python / tooling
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+
+# Local environments and compiler caches
+.venv/
+venv/
+env/
+.cache/
+.triton/
+
+# Generated benchmark output
+logs/
+results/
+*.log
+
+# Local editor and OS files
+.idea/
+.vscode/
+Thumbs.db
+.DS_Store
