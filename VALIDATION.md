@@ -1,7 +1,7 @@
 # 本机部署验证（2026-10-21）
 
-当前版本已同步到 perf4.1，包内 13 文件与最新版压缩包逐字节一致；
-新版本回归、同轮 eager 对照和进一步分析见 [PERF4_1_REVIEW.md](PERF4_1_REVIEW.md)。
+本文是首次部署历史记录。当前版本和验收见 [README.md](README.md) 与 [READABILITY_REVIEW.md](READABILITY_REVIEW.md)。
+同步 perf4.1 时，包内 13 文件与最新版压缩包逐字节一致；当时的回归、同轮 eager 对照和进一步分析见 [PERF4_1_REVIEW.md](PERF4_1_REVIEW.md)。
 以下保留首次 perf4 部署的历史结果，不能把跨轮耗时差解释为 perf4.1 算法收益。
 
 ## 首次 perf4 部署记录

@@ -61,7 +61,8 @@ def acceleration_status(device="cuda"):
     device = torch.device(device)
     cuda_ok = device.type == "cuda" and torch.cuda.is_available()
     result = {
-        "device": str(device), "triton_installed": kernels.available(),
+        "device": str(device),
+        "triton_installed": kernels.available(),
         "cuda_available": cuda_ok,
         "available": cuda_ok and kernels.available(),
         "warp_padding_modes": ("zeros", "border"),
@@ -79,6 +80,7 @@ def acceleration_status(device="cuda"):
 
 
 def _select_accelerator(acceleration, *tensors):
+    """Resolve the requested backend using metadata, without launching work."""
     if acceleration == "eager":
         return None
     if acceleration not in ("auto", "triton"):
@@ -87,8 +89,56 @@ def _select_accelerator(acceleration, *tensors):
     if kernels.supported(*tensors):
         return kernels
     if acceleration == "triton":
-        raise RuntimeError("acceleration='triton' requires Triton and inference float32 CUDA inputs")
+        raise RuntimeError(
+            "acceleration='triton' requires Triton and inference float32 CUDA inputs"
+        )
     return None
+
+
+def _validate_blur_backend(blur_backend):
+    """Keep the accepted blur routes and their error message in one place."""
+    if blur_backend not in ("torch", "triton", "separable"):
+        raise ValueError("blur_backend must be 'torch', 'triton' or 'separable'")
+
+
+def _validate_separable_factors(canvas, motion_kernel, blur_factors):
+    """Return (ky, kx) after shape/device checks; factor values are not read."""
+    if blur_factors is None or len(blur_factors) != 2:
+        raise ValueError(
+            "separable blur requires verified (ky,kx) factors; use dense blur for other kernels"
+        )
+    ky, kx = blur_factors
+    if (
+        motion_kernel.ndim != 4
+        or ky.ndim != 1
+        or kx.ndim != 1
+        or (ky.numel(), kx.numel()) != tuple(motion_kernel.shape[-2:])
+        or any(k.device != canvas.device or k.dtype != canvas.dtype for k in (ky, kx))
+        or any(n < 1 or n > 63 or n % 2 != 1 for n in (ky.numel(), kx.numel()))
+    ):
+        raise ValueError(
+            "separable factors must match shared dense kernel, dtype/device; odd lengths <=63"
+        )
+    return ky, kx
+
+
+def _blur_canvas_torch(canvas, motion_kernel, batch, height, width):
+    """Apply the dense reference blur, keeping RGBA and groups independent.
+
+    A four-dimensional kernel shares four channel weights across B. A
+    five-dimensional kernel provides separate weights for every batch group.
+    The latter folds B into the channel axis for one grouped convolution.
+    """
+    kh, kw = motion_kernel.shape[-2:]
+    padding = (kh // 2, kw // 2)
+    if motion_kernel.ndim == 4:
+        return F.conv2d(canvas, motion_kernel, padding=padding, groups=4)
+    return F.conv2d(
+        canvas.reshape(1, batch * 4, height, width),
+        motion_kernel.reshape(batch * 4, 1, kh, kw),
+        padding=padding,
+        groups=batch * 4,
+    ).reshape(batch, 4, height, width)
 
 
 def paste_gpu_batch(
@@ -135,9 +185,12 @@ def paste_gpu_batch(
     acceleration可用时使用两阶段Triton，否则用PyTorch两次一维卷积。
     快速路径要求有限 grid/图像/透明度/mask 数值；不会逐帧扫描数值。
     Triton 运行/编译异常不会被静默捕获。先在目标卡验证再启用。
+
+    执行顺序：按广告位覆盖 RGBA 画布 → 全图畸变采样 → 模糊及背景融合。
+    返回独立 GPU uint8 [B,H,W,3]；同步 NumPy 导出由 adapter 负责。
+    blur_launch_config 仅传给可分离 Triton 路径，不改变其他模糊路由。
     """
-    if blur_backend not in ("torch", "triton", "separable"):
-        raise ValueError("blur_backend must be 'torch', 'triton' or 'separable'")
+    _validate_blur_backend(blur_backend)
     batch = ads_by_slot[0].shape[0] if ads_by_slot else frames.shape[0]
     height, width = frames.shape[-2:]
     canvas = frames.new_zeros((batch, 4, height, width))
@@ -152,15 +205,22 @@ def paste_gpu_batch(
             slot_accelerator = _select_accelerator(acceleration, source, grid, opacity, canvas)
             if slot_accelerator is not None:
                 slot_accelerator.warp_paste_into(
-                    source, grid, opacity, canvas, (x1, y1, x2, y2),
+                    source,
+                    grid,
+                    opacity,
+                    canvas,
+                    (x1, y1, x2, y2),
                     align_corners=warp_align_corners,
-                    padding_mode=warp_padding_mode, legacy_alpha=legacy_alpha,
+                    padding_mode=warp_padding_mode,
+                    legacy_alpha=legacy_alpha,
                 )
                 continue
 
         if legacy_alpha:
             warped = F.grid_sample(
-                source, grid, mode="bilinear",
+                source,
+                grid,
+                mode="bilinear",
                 padding_mode=warp_padding_mode,
                 align_corners=warp_align_corners,
             )
@@ -168,46 +228,69 @@ def paste_gpu_batch(
             patch = torch.cat((warped[:, :3] * alpha, alpha), dim=1)
         else:
             source_alpha = source[:, 3:4] * (1.0 / 255.0)
-            premultiplied = torch.cat(
-                (source[:, :3] * source_alpha, source_alpha), dim=1
+            premultiplied = torch.cat((source[:, :3] * source_alpha, source_alpha), dim=1)
+            patch = (
+                F.grid_sample(
+                    premultiplied,
+                    grid,
+                    mode="bilinear",
+                    padding_mode=warp_padding_mode,
+                    align_corners=warp_align_corners,
+                )
+                * opacity
             )
-            patch = F.grid_sample(
-                premultiplied, grid, mode="bilinear",
-                padding_mode=warp_padding_mode,
-                align_corners=warp_align_corners,
-            ) * opacity
 
         # 与原实现一致：后一个 bbox 整块覆盖前一个 bbox，不做广告间 over。
         canvas[:, :, y1:y2, x1:x2] = patch
 
     return _finish_canvas(
-        canvas, frames, distortion_grid, motion_kernel, mask_canvas,
-        distortion_align_corners, distortion_padding_mode, legacy_alpha,
-        acceleration=acceleration, blur_backend=blur_backend, blur_factors=blur_factors,
+        canvas,
+        frames,
+        distortion_grid,
+        motion_kernel,
+        mask_canvas,
+        distortion_align_corners,
+        distortion_padding_mode,
+        legacy_alpha,
+        acceleration=acceleration,
+        blur_backend=blur_backend,
+        blur_factors=blur_factors,
         blur_launch_config=blur_launch_config,
     )
 
 
-def _finish_canvas(canvas, frames, distortion_grid, motion_kernel, mask_canvas,
-                   distortion_align_corners, distortion_padding_mode, legacy_alpha,
-                   *, acceleration="eager", blur_backend="torch", blur_factors=None,
-                   blur_launch_config=None):
-    if blur_backend not in ("torch", "triton", "separable"):
-        raise ValueError("blur_backend must be 'torch', 'triton' or 'separable'")
+def _finish_canvas(
+    canvas,
+    frames,
+    distortion_grid,
+    motion_kernel,
+    mask_canvas,
+    distortion_align_corners,
+    distortion_padding_mode,
+    legacy_alpha,
+    *,
+    acceleration="eager",
+    blur_backend="torch",
+    blur_factors=None,
+    blur_launch_config=None,
+):
+    """Finish either compositing path with distortion, blur, and BHWC export.
+
+    Both callers supply a float32 [B,4,H,W] canvas. Distortion always uses
+    PyTorch grid_sample; the selected blur route decides whether final alpha,
+    mask blending and uint8 conversion are fused into its last GPU kernel.
+    """
+    _validate_blur_backend(blur_backend)
     if blur_backend == "separable":
-        if blur_factors is None or len(blur_factors) != 2:
-            raise ValueError("separable blur requires verified (ky,kx) factors; use dense blur for other kernels")
-        ky, kx = blur_factors
-        if (motion_kernel.ndim != 4 or ky.ndim != 1 or kx.ndim != 1
-                or (ky.numel(), kx.numel()) != tuple(motion_kernel.shape[-2:])
-                or any(k.device != canvas.device or k.dtype != canvas.dtype for k in (ky, kx))
-                or any(n < 1 or n > 63 or n % 2 != 1 for n in (ky.numel(), kx.numel()))):
-            raise ValueError("separable factors must match shared dense kernel, dtype/device; odd lengths <=63")
+        ky, kx = _validate_separable_factors(canvas, motion_kernel, blur_factors)
+
     batch, _, height, width = canvas.shape
     background = frames.expand(batch, -1, -1, -1)
     canvas = F.grid_sample(
-        canvas, distortion_grid.expand(batch, -1, -1, -1),
-        mode="bilinear", padding_mode=distortion_padding_mode,
+        canvas,
+        distortion_grid.expand(batch, -1, -1, -1),
+        mode="bilinear",
+        padding_mode=distortion_padding_mode,
         align_corners=distortion_align_corners,
     )
 
@@ -215,46 +298,49 @@ def _finish_canvas(canvas, frames, distortion_grid, motion_kernel, mask_canvas,
         accelerator = _select_accelerator(acceleration, canvas, background, ky, kx, mask_canvas)
         if accelerator is not None:
             return _optional_gaussian_kernels().separable_blur_blend_to_uint8(
-                canvas, background, ky, kx, mask_canvas, legacy_alpha=legacy_alpha,
+                canvas,
+                background,
+                ky,
+                kx,
+                mask_canvas,
+                legacy_alpha=legacy_alpha,
                 launch_config=blur_launch_config,
             )
         # Explicit eager/CPU reference: same zero-padded separable cross-correlation.
-        canvas = F.conv2d(canvas, kx.view(1, 1, 1, -1).expand(4, 1, 1, -1),
-                          padding=(0, kx.numel() // 2), groups=4)
-        canvas = F.conv2d(canvas, ky.view(1, 1, -1, 1).expand(4, 1, -1, 1),
-                          padding=(ky.numel() // 2, 0), groups=4)
+        canvas = F.conv2d(
+            canvas, kx.view(1, 1, 1, -1).expand(4, 1, 1, -1), padding=(0, kx.numel() // 2), groups=4
+        )
+        canvas = F.conv2d(
+            canvas, ky.view(1, 1, -1, 1).expand(4, 1, -1, 1), padding=(ky.numel() // 2, 0), groups=4
+        )
         return _blend_canvas_eager(canvas, background, mask_canvas, legacy_alpha)
 
     if blur_backend == "triton":
         # Explicit opt-in: never silently benchmark a PyTorch fallback as Triton.
         accelerator = _select_accelerator("triton", canvas, background, motion_kernel, mask_canvas)
         return accelerator.blur_blend_to_uint8(
-            canvas, background, motion_kernel, mask_canvas, legacy_alpha=legacy_alpha,
+            canvas,
+            background,
+            motion_kernel,
+            mask_canvas,
+            legacy_alpha=legacy_alpha,
         )
 
-    kh, kw = motion_kernel.shape[-2:]
-    padding = (kh // 2, kw // 2)
-    if motion_kernel.ndim == 4:
-        # batch 的各组互不混合，4 个 RGBA 通道独立卷积。
-        canvas = F.conv2d(canvas, motion_kernel, padding=padding, groups=4)
-    else:
-        # 将 B 放入通道：一次 grouped conv 实现 B 组不同的模糊核。
-        canvas = F.conv2d(
-            canvas.reshape(1, batch * 4, height, width),
-            motion_kernel.reshape(batch * 4, 1, kh, kw),
-            padding=padding, groups=batch * 4,
-        ).reshape(batch, 4, height, width)
-
+    canvas = _blur_canvas_torch(canvas, motion_kernel, batch, height, width)
     accelerator = _select_accelerator(acceleration, canvas, background, mask_canvas)
     if accelerator is not None:
         return accelerator.blend_to_uint8(
-            canvas, background, mask_canvas, legacy_alpha=legacy_alpha,
+            canvas,
+            background,
+            mask_canvas,
+            legacy_alpha=legacy_alpha,
         )
 
     return _blend_canvas_eager(canvas, background, mask_canvas, legacy_alpha)
 
 
 def _blend_canvas_eager(canvas, background, mask_canvas, legacy_alpha):
+    """Reference blend: preserve alpha/mask rounding before uint8 BHWC conversion."""
     alpha = canvas[:, 3:4]
     color = canvas[:, :3]
     if legacy_alpha:
@@ -272,6 +358,7 @@ def make_paste_callable(bboxes: Sequence[Sequence[int]], **options) -> Callable:
 
 # -------------------- 按素材尺寸分桶的进阶版本 --------------------
 
+
 def _plan_buckets(source_hws, bboxes, canvas_hw, area_caps=None):
     """纯 CPU 布局规划；顺序覆盖生成 LUT，无 PyTorch 依赖。"""
     height, width = map(int, canvas_hw)
@@ -287,34 +374,42 @@ def _plan_buckets(source_hws, bboxes, canvas_hw, area_caps=None):
     for i, ((src_h, src_w), (x1, y1, x2, y2)) in enumerate(zip(shapes, boxes)):
         if src_h < 1 or src_w < 1 or not (0 <= x1 < x2 <= width and 0 <= y1 < y2 <= height):
             raise ValueError("source sizes must be positive; bboxes must be inside canvas")
-        area = (y2-y1)*(x2-x1)
+        area = (y2 - y1) * (x2 - x1)
         cap = next((c for c in caps if c >= area), None) if caps else None
         if caps and cap is None:
             raise ValueError("ROI exceeds largest area cap")
         groups_by_key.setdefault((src_h, src_w, cap), []).append(i)
         areas.append(area)
-    groups, lengths = [], []
-    offsets = [0]*len(boxes)
+    groups = []
+    lengths = []
+    offsets = [0] * len(boxes)
     cursor = 1  # palette 第 0 个像素为全零哨兵，供画布空白处读取。
     for key, members in groups_by_key.items():
         capacity = key[2] if key[2] is not None else max(areas[i] for i in members)
         groups.append(tuple(members))
         lengths.append(capacity)
         for local_id, slot_id in enumerate(members):
-            offsets[slot_id] = cursor + local_id*capacity
-        cursor += len(members)*capacity
+            offsets[slot_id] = cursor + local_id * capacity
+        cursor += len(members) * capacity
 
-    lookup = array("q", [0])*(height*width)
+    lookup = array("q", [0]) * (height * width)
     # 始终按原广告位顺序写，而非按分桶后顺序写，保留重叠覆盖语义。
     for i, (x1, y1, x2, y2) in enumerate(boxes):
-        roi_w = x2-x1
-        for local_y in range(y2-y1):
-            dst = (y1+local_y)*width+x1
-            src = offsets[i]+local_y*roi_w
-            lookup[dst:dst+roi_w] = array("q", range(src, src+roi_w))
-    return dict(groups=tuple(groups), lengths=tuple(lengths), offsets=tuple(offsets),
-                bboxes=boxes, source_hws=shapes, canvas_hw=(height, width),
-                lookup=lookup, padding_ratio=(cursor-1)/sum(areas))
+        roi_w = x2 - x1
+        for local_y in range(y2 - y1):
+            dst = (y1 + local_y) * width + x1
+            src = offsets[i] + local_y * roi_w
+            lookup[dst : dst + roi_w] = array("q", range(src, src + roi_w))
+    return dict(
+        groups=tuple(groups),
+        lengths=tuple(lengths),
+        offsets=tuple(offsets),
+        bboxes=boxes,
+        source_hws=shapes,
+        canvas_hw=(height, width),
+        lookup=lookup,
+        padding_ratio=(cursor - 1) / sum(areas),
+    )
 
 
 def make_bucket_layout(ads_by_slot, bboxes, canvas_hw, *, area_caps=None):
@@ -334,9 +429,11 @@ def make_bucket_layout(ads_by_slot, bboxes, canvas_hw, *, area_caps=None):
     lookup = plan.pop("lookup")
     if lookup.itemsize != 8:
         raise RuntimeError("int64 lookup requires 8-byte array('q')")
-    plan["canvas_lut"] = torch.frombuffer(lookup, dtype=torch.int64).to(
-        device=ads_by_slot[0].device
-    ).reshape(*plan["canvas_hw"])
+    plan["canvas_lut"] = (
+        torch.frombuffer(lookup, dtype=torch.int64)
+        .to(device=ads_by_slot[0].device)
+        .reshape(*plan["canvas_hw"])
+    )
     return plan
 
 
@@ -349,8 +446,7 @@ def pack_bucket_ads(ads_by_slot, layout):
     for ad, shape in zip(ads_by_slot, layout["source_hws"]):
         if ad.shape != (batch, 4, *shape) or ad.dtype != torch.float32 or ad.device != device:
             raise ValueError("ads must match layout and share batch/device/float32")
-    return tuple(torch.stack([ads_by_slot[i] for i in ids], dim=1)
-                 for ids in layout["groups"])
+    return tuple(torch.stack([ads_by_slot[i] for i in ids], dim=1) for ids in layout["groups"])
 
 
 @torch.inference_mode()
@@ -367,15 +463,19 @@ def pack_bucket_grids(warp_grids, layout, batch_size):
         grids = []
         for i in ids:
             x1, y1, x2, y2 = layout["bboxes"][i]
-            if not 0 < (y2-y1)*(x2-x1) <= length:
+            if not 0 < (y2 - y1) * (x2 - x1) <= length:
                 raise ValueError("ROI exceeds bucket capacity or is empty; rebuild layout")
             grid = warp_grids[i]
-            if grid.ndim != 4 or grid.shape[0] not in (1, batch_size) or grid.shape[1:] != (y2-y1, x2-x1, 2):
+            if (
+                grid.ndim != 4
+                or grid.shape[0] not in (1, batch_size)
+                or grid.shape[1:] != (y2 - y1, x2 - x1, 2)
+            ):
                 raise ValueError("warp grid must match bbox with batch 1 or B")
             if grid.dtype != torch.float32 or grid.device != layout["canvas_lut"].device:
                 raise ValueError("warp grids must be float32 on layout device")
             flat = grid.expand(batch_size, -1, -1, -1).reshape(batch_size, -1, 2)
-            grids.append(F.pad(flat, (0, 0, 0, length-flat.shape[1]), value=2.0))
+            grids.append(F.pad(flat, (0, 0, 0, length - flat.shape[1]), value=2.0))
         packed.append(torch.stack(grids, dim=1))
     return tuple(packed)
 
@@ -390,23 +490,36 @@ def pack_bucket_transparencies(transparencies, layout, batch_size):
         values = []
         for i in ids:
             x1, y1, x2, y2 = layout["bboxes"][i]
-            if not 0 < (y2-y1)*(x2-x1) <= length:
+            if not 0 < (y2 - y1) * (x2 - x1) <= length:
                 raise ValueError("ROI exceeds bucket capacity or is empty; rebuild layout")
             value = transparencies[i]
             if value.dtype != torch.float32 or value.device != layout["canvas_lut"].device:
                 raise ValueError("transparencies must be float32 on layout device")
-            flat = value.expand(batch_size, 1, y2-y1, x2-x1).reshape(batch_size, 1, -1)
-            values.append(F.pad(flat, (0, length-flat.shape[-1]), value=0.0))
+            flat = value.expand(batch_size, 1, y2 - y1, x2 - x1).reshape(batch_size, 1, -1)
+            values.append(F.pad(flat, (0, length - flat.shape[-1]), value=0.0))
         packed.append(torch.stack(values, dim=1))
     return tuple(packed)
 
 
 def paste_gpu_bucketed(
-    frames, ads_buckets, warp_grids_buckets, distortion_grid,
-    motion_kernel, mask_canvas, transparencies_buckets, canvas_lut,
-    *, warp_align_corners=False, distortion_align_corners=False,
-    warp_padding_mode="zeros", distortion_padding_mode="zeros", legacy_alpha=True,
-    acceleration="eager", blur_backend="torch", blur_factors=None, blur_launch_config=None,
+    frames,
+    ads_buckets,
+    warp_grids_buckets,
+    distortion_grid,
+    motion_kernel,
+    mask_canvas,
+    transparencies_buckets,
+    canvas_lut,
+    *,
+    warp_align_corners=False,
+    distortion_align_corners=False,
+    warp_padding_mode="zeros",
+    distortion_padding_mode="zeros",
+    legacy_alpha=True,
+    acceleration="eager",
+    blur_backend="torch",
+    blur_factors=None,
+    blur_launch_config=None,
 ):
     """仅有分桶循环的纯Tensor核心：K次透视采样+一次索引取值合成画布。
 
@@ -426,11 +539,16 @@ def paste_gpu_bucketed(
     acceleration 对最终融合/uint8/BHWC 输出启用 Triton；分桶采样不变。
     blur_backend='triton' 额外将模糊与最终融合合并，限制同 paste_gpu_batch。
     """
-    if blur_backend not in ("torch", "triton", "separable"):
-        raise ValueError("blur_backend must be 'torch', 'triton' or 'separable'")
-    if not ads_buckets or not len(ads_buckets) == len(warp_grids_buckets) == len(transparencies_buckets):
+    _validate_blur_backend(blur_backend)
+    if not ads_buckets or not len(ads_buckets) == len(warp_grids_buckets) == len(
+        transparencies_buckets
+    ):
         raise ValueError("need equal, nonempty bucket tuples")
-    if canvas_lut.shape != frames.shape[-2:] or canvas_lut.dtype != torch.int64 or canvas_lut.device != frames.device:
+    if (
+        canvas_lut.shape != frames.shape[-2:]
+        or canvas_lut.dtype != torch.int64
+        or canvas_lut.device != frames.device
+    ):
         raise ValueError("canvas_lut must be int64 [H,W] on frame device")
     batch = ads_buckets[0].shape[0]
     palette_parts = [frames.new_zeros((batch, 4, 1))]
@@ -439,29 +557,38 @@ def paste_gpu_bucketed(
         length = grids.shape[2]
         if not legacy_alpha:
             source_alpha = source[:, :, 3:4] * (1.0 / 255.0)
-            source = torch.cat((source[:, :, :3]*source_alpha, source_alpha), dim=2)
+            source = torch.cat((source[:, :, :3] * source_alpha, source_alpha), dim=2)
         warped = F.grid_sample(
-            source.reshape(batch*members, 4, src_h, src_w),
-            grids.reshape(batch*members, 1, length, 2),
-            mode="bilinear", padding_mode=warp_padding_mode,
+            source.reshape(batch * members, 4, src_h, src_w),
+            grids.reshape(batch * members, 1, length, 2),
+            mode="bilinear",
+            padding_mode=warp_padding_mode,
             align_corners=warp_align_corners,
         ).reshape(batch, members, 4, length)
         if legacy_alpha:
             alpha = warped[:, :, 3:4] * (1.0 / 255.0) * opacity
-            patch = torch.cat((warped[:, :, :3]*alpha, alpha), dim=2)
+            patch = torch.cat((warped[:, :, :3] * alpha, alpha), dim=2)
         else:
-            patch = warped*opacity
+            patch = warped * opacity
         # 不能直接reshape(B,4,M*L)，必须先交换M/C维。
-        palette_parts.append(patch.permute(0, 2, 1, 3).reshape(batch, 4, members*length))
+        palette_parts.append(patch.permute(0, 2, 1, 3).reshape(batch, 4, members * length))
 
     palette = torch.cat(palette_parts, dim=2)
     height, width = frames.shape[-2:]
     # 每个画布像素只读其最终所有者，没有重复目的地址的scatter竞争。
     canvas = torch.index_select(palette, 2, canvas_lut.reshape(-1)).reshape(batch, 4, height, width)
     return _finish_canvas(
-        canvas, frames, distortion_grid, motion_kernel, mask_canvas,
-        distortion_align_corners, distortion_padding_mode, legacy_alpha,
-        acceleration=acceleration, blur_backend=blur_backend, blur_factors=blur_factors,
+        canvas,
+        frames,
+        distortion_grid,
+        motion_kernel,
+        mask_canvas,
+        distortion_align_corners,
+        distortion_padding_mode,
+        legacy_alpha,
+        acceleration=acceleration,
+        blur_backend=blur_backend,
+        blur_factors=blur_factors,
         blur_launch_config=blur_launch_config,
     )
 
@@ -500,12 +627,16 @@ def stack_img_groups(
             if images and source.shape != images[0].shape:
                 raise ValueError(f"image shapes differ across groups for slot {key}")
             images.append(source)
-        slots.append(torch.stack(images, dim=0).permute(0,3,1,2).contiguous())
+        slots.append(torch.stack(images, dim=0).permute(0, 3, 1, 2).contiguous())
     return tuple(slots)
 
 
 def validate_inputs(args: tuple, bboxes: Sequence[Sequence[int]]) -> None:
-    """图外检查结构；不读取 GPU 数值，不检查值域或核归一化。"""
+    """检查核心七元组的 shape/device/dtype 与 ROI 对应关系。
+
+    输入顺序与 paste_gpu_batch 相同，不含关键字配置和 bboxes。
+    此检查在图外执行；不读取 GPU 数值，不检查值域或核归一化。
+    """
     frames, ads, grids, distortion, kernel, mask, opacities = args
     if frames.ndim != 4 or frames.shape[1] != 3:
         raise ValueError("frames must be [1|B,3,H,W]")
@@ -526,13 +657,32 @@ def validate_inputs(args: tuple, bboxes: Sequence[Sequence[int]]) -> None:
             raise ValueError(f"bbox {i} must be nonempty and inside canvas")
         if ad.ndim != 4 or ad.shape[:2] != (batch, 4):
             raise ValueError(f"ad {i} must be [B,4,h,w]")
-        if grid.ndim != 4 or grid.shape[0] not in (1, batch) or grid.shape[1:] != (y2-y1, x2-x1, 2):
+        if (
+            grid.ndim != 4
+            or grid.shape[0] not in (1, batch)
+            or grid.shape[1:] != (y2 - y1, x2 - x1, 2)
+        ):
             raise ValueError(f"grid {i} must be [1|B,roi_h,roi_w,2]")
-        if opacity.ndim != 4 or opacity.shape[0] not in (1, batch) or opacity.shape[1] != 1 or opacity.shape[2] not in (1, y2-y1) or opacity.shape[3] not in (1, x2-x1):
+        if (
+            opacity.ndim != 4
+            or opacity.shape[0] not in (1, batch)
+            or opacity.shape[1] != 1
+            or opacity.shape[2] not in (1, y2 - y1)
+            or opacity.shape[3] not in (1, x2 - x1)
+        ):
             raise ValueError(f"transparency {i} must broadcast to [B,1,roi_h,roi_w]")
-    if distortion.ndim != 4 or distortion.shape[0] not in (1, batch) or distortion.shape[1:] != (height, width, 2):
+    if (
+        distortion.ndim != 4
+        or distortion.shape[0] not in (1, batch)
+        or distortion.shape[1:] != (height, width, 2)
+    ):
         raise ValueError("distortion_grid must be [1|B,H,W,2]")
-    if mask.ndim != 4 or mask.shape[0] not in (1, batch) or mask.shape[1] not in (1, 3) or mask.shape[-2:] != (height, width):
+    if (
+        mask.ndim != 4
+        or mask.shape[0] not in (1, batch)
+        or mask.shape[1] not in (1, 3)
+        or mask.shape[-2:] != (height, width)
+    ):
         raise ValueError("mask_canvas must be [1|B,1|3,H,W]")
     if kernel.ndim == 4:
         good_kernel = kernel.shape[:2] == (4, 1)
@@ -563,6 +713,9 @@ def homography_roi_grid(
     不负责复刻未知的第三方 warp 实现；已有 grid 时优先直接复用。
     acceleration='auto'/'triton' 可用单个 kernel 建网格，矩阵值/ROI 尺寸/
     bbox 坐标均为动态参数；矩阵变化不要求每帧重新编译 Triton kernel。
+
+    此兼容 helper 对无效 z 写远离图像的哨兵坐标；它不同于共享构造模块
+    build_roi_grid_gpu 的 z+eps 规则，不能互换这两种几何语义。
     """
     if inverse_matrix.dtype != torch.float32:
         raise ValueError("inverse_matrix must be float32")
@@ -573,21 +726,26 @@ def homography_roi_grid(
     if src_h < 1 or src_w < 1 or (align_corners and min(src_h, src_w) < 2):
         raise ValueError("positive source sizes required; align_corners=True requires both >=2")
     x1, y1, x2, y2 = bbox
-    roi_h, roi_w = y2-y1, x2-x1
+    roi_h, roi_w = y2 - y1, x2 - x1
     if roi_h <= 0 or roi_w <= 0:
         raise ValueError("bbox must be nonempty")
     accelerator = _select_accelerator(acceleration, matrix)
     if accelerator is not None:
         return accelerator.build_homography_grid(
-            matrix, source_hw, bbox, matrix_uses_canvas_xy=matrix_uses_canvas_xy,
-            align_corners=align_corners, eps=eps,
+            matrix,
+            source_hw,
+            bbox,
+            matrix_uses_canvas_xy=matrix_uses_canvas_xy,
+            align_corners=align_corners,
+            eps=eps,
         )
     y, x = torch.meshgrid(
         torch.arange(roi_h, device=matrix.device, dtype=matrix.dtype),
-        torch.arange(roi_w, device=matrix.device, dtype=matrix.dtype), indexing="ij"
+        torch.arange(roi_w, device=matrix.device, dtype=matrix.dtype),
+        indexing="ij",
     )
     if matrix_uses_canvas_xy:
-        x, y = x+x1, y+y1
+        x, y = x + x1, y + y1
     coordinates = torch.stack((x, y, torch.ones_like(x)), dim=0).reshape(1, 3, -1)
     projected = matrix @ coordinates
     z = projected[:, 2:3]
@@ -596,9 +754,9 @@ def homography_roi_grid(
     xy = projected[:, :2] / safe_z
     sx, sy = xy[:, 0], xy[:, 1]
     if align_corners:
-        gx, gy = 2*sx/(src_w-1)-1, 2*sy/(src_h-1)-1
+        gx, gy = 2 * sx / (src_w - 1) - 1, 2 * sy / (src_h - 1) - 1
     else:
-        gx, gy = (2*sx+1)/src_w-1, (2*sy+1)/src_h-1
+        gx, gy = (2 * sx + 1) / src_w - 1, (2 * sy + 1) / src_h - 1
     grid = torch.stack((gx, gy), dim=-1)
     # 避免把无穷远/NaN 误变成图像内采样；使用 zeros padding 才会置零。
     valid_grid = valid.transpose(1, 2) & torch.isfinite(grid).all(dim=-1, keepdim=True)
@@ -624,7 +782,12 @@ def _clone_tree(tree):
 
 def _copy_tree(destination, source):
     if isinstance(destination, torch.Tensor):
-        if not isinstance(source, torch.Tensor) or destination.shape != source.shape or destination.dtype != source.dtype or destination.device != source.device:
+        if (
+            not isinstance(source, torch.Tensor)
+            or destination.shape != source.shape
+            or destination.dtype != source.dtype
+            or destination.device != source.device
+        ):
             raise ValueError("CUDA Graph replay requires unchanged tensor shape, dtype and device")
         destination.copy_(source)
     else:
@@ -678,13 +841,15 @@ class StaticPasteGraph:
     def __call__(self, *new_args, copy_output: bool = True):
         with torch.cuda.device(self.device):
             if torch.cuda.current_stream(self.device) != self.stream:
-                raise RuntimeError("use the same CUDA stream as construction; object is not concurrent")
+                raise RuntimeError(
+                    "use the same CUDA stream as construction; object is not concurrent"
+                )
             _copy_tree(self.inputs, new_args)
             self.graph.replay()
             return self.output.clone() if copy_output else self.output
 
 
-BUCKET_EXAMPLE = r'''
+BUCKET_EXAMPLE = r"""
 # 复用 EXAMPLE 中准备的 frames/ads_by_slot/grids/distortion/kernel/mask/
 # transparencies/bboxes；源数据结构仍与旧版相同。
 import torch
@@ -725,10 +890,10 @@ with torch.inference_mode():
 # LUT为int64全画布：1080p约16.6MB，动态bbox不要忽略逐帧CPU重建/上传。
 # 高性能动态布局需固定slot桶归属/容量，并在GPU上更新grid+LUT内容。
 # 当前make_bucket_layout只提供初始化/布局变化时的CPU规划工具。
-'''
+"""
 
 
-EXAMPLE = r'''
+EXAMPLE = r"""
 # 假设现有 frame_input 为 CUDA HWC float/uint8，B 组素材已按广告位堆好。
 # 素材缓存: ads_by_slot[i] = [B,4,h_i,w_i], float32, CUDA。
 # 不要在每帧重复 stack 不变素材；换素材时更新/重建该缓存。
@@ -796,4 +961,4 @@ else:
     # GPU uint8 [B,H,W,3]；如果后续仍在 GPU 上处理就直接使用 result。
     # 必须 NumPy 时只在整个 batch 最后做一次 D2H：
     result_numpy = result.cpu().numpy()
-'''
+"""

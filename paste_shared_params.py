@@ -76,22 +76,27 @@ def _same_float32(*tensors):
 
 
 def _normal_grid(source_x, source_y, source_hw, aligned):
-    h, w = source_hw
+    """Convert source-pixel coordinates to the sampler's final xy dimension."""
+    height, width = source_hw
     if aligned:
-        gx, gy = 2.0*source_x/(w-1)-1.0, 2.0*source_y/(h-1)-1.0
+        grid_x = 2.0 * source_x / (width - 1) - 1.0
+        grid_y = 2.0 * source_y / (height - 1) - 1.0
     else:
-        gx, gy = (2.0*source_x+1.0)/w-1.0, (2.0*source_y+1.0)/h-1.0
-    return torch.stack((gx, gy), dim=-1)
+        grid_x = (2.0 * source_x + 1.0) / width - 1.0
+        grid_y = (2.0 * source_y + 1.0) / height - 1.0
+    return torch.stack((grid_x, grid_y), dim=-1)
 
 
-def create_roi_grid_torch(source_hw, inv_matrix, roi_hw, *, align_corners=False,
-                          normalization="legacy", eps=1e-8):
+def create_roi_grid_torch(
+    source_hw, inv_matrix, roi_hw, *, align_corners=False, normalization="legacy", eps=1e-8
+):
     """Return [1|B,roi_H,roi_W,2], using local xy and denominator z+eps.
 
     Matrix values are read live. No .item(), .tolist(), CPU transfer or finite-z
     clamp is performed. Float32 rounding follows this torch implementation.
     """
-    source_hw, roi_hw = _hw(source_hw, "source_hw"), _hw(roi_hw, "roi_hw")
+    source_hw = _hw(source_hw, "source_hw")
+    roi_hw = _hw(roi_hw, "roi_hw")
     aligned = _aligned(normalization, align_corners, source_hw)
     if isinstance(eps, bool) or not isinstance(eps, Real) or not math.isfinite(eps) or eps < 0:
         raise ValueError("eps must be a finite nonnegative Python real number")
@@ -99,36 +104,50 @@ def create_roi_grid_torch(source_hw, inv_matrix, roi_hw, *, align_corners=False,
     matrix = inv_matrix.unsqueeze(0) if inv_matrix.ndim == 2 else inv_matrix
     if matrix.ndim != 3 or matrix.shape[-2:] != (3, 3) or matrix.shape[0] < 1:
         raise ValueError("inv_matrix must be [3,3] or [B,3,3] with B>=1")
-    rh, rw = roi_hw
-    yy, xx = torch.meshgrid(torch.arange(rh, device=matrix.device, dtype=torch.float32),
-                           torch.arange(rw, device=matrix.device, dtype=torch.float32),
-                           indexing="ij")
-    coordinates = torch.stack((xx, yy, torch.ones_like(xx)), dim=0).reshape(1, 3, -1)
+    roi_height, roi_width = roi_hw
+    pixel_y, pixel_x = torch.meshgrid(
+        torch.arange(roi_height, device=matrix.device, dtype=torch.float32),
+        torch.arange(roi_width, device=matrix.device, dtype=torch.float32),
+        indexing="ij",
+    )
+    coordinates = torch.stack((pixel_x, pixel_y, torch.ones_like(pixel_x)), dim=0).reshape(1, 3, -1)
     projected = matrix @ coordinates
     xy = projected[:, :2] / (projected[:, 2:3] + float(eps))
     return _normal_grid(xy[:, 0], xy[:, 1], source_hw, aligned).reshape(
-        matrix.shape[0], rh, rw, 2)
+        matrix.shape[0], roi_height, roi_width, 2
+    )
 
 
 def _distortion_terms(x, y, k1, k2, p1, p2, k3):
-    r2 = x*x + y*y
-    r4 = r2*r2
-    r6 = r4*r2
-    radial = 1.0 + k1*r2 + k2*r4 + k3*r6
-    tx = 2.0*p1*x*y + p2*(r2 + 2.0*x*x)
-    ty = p1*(r2 + 2.0*y*y) + 2.0*p2*x*y
+    """Return radial scale and tangential offsets in normalized camera coordinates."""
+    r2 = x * x + y * y
+    r4 = r2 * r2
+    r6 = r4 * r2
+    radial = 1.0 + k1 * r2 + k2 * r4 + k3 * r6
+    tx = 2.0 * p1 * x * y + p2 * (r2 + 2.0 * x * x)
+    ty = p1 * (r2 + 2.0 * y * y) + 2.0 * p2 * x * y
     return radial, tx, ty
 
 
-def create_distortion_grid_torch(H, W, K, dist_coeffs, *, align_corners=False,
-                                 inverse=False, iterations=10, normalization="legacy"):
+def create_distortion_grid_torch(
+    H,
+    W,
+    K,
+    dist_coeffs,
+    *,
+    align_corners=False,
+    inverse=False,
+    iterations=10,
+    normalization="legacy",
+):
     """Return [1,H,W,2] with the supplied original distortion equations.
 
     Coefficient lengths 1 / 2..4 / >=5 mean k1 / k1,k2 / k1,k2,p1,p2,k3.
     inverse=True performs simultaneous fixed-point x/y updates. Coefficients
     and K remain live tensors; malformed calibration values are not repaired.
     """
-    H, W = _size(H, "H"), _size(W, "W")
+    H = _size(H, "H")
+    W = _size(W, "W")
     aligned = _aligned(normalization, align_corners, (H, W))
     iterations = _size(iterations, "iterations", minimum=0)
     if not isinstance(inverse, bool):
@@ -140,21 +159,29 @@ def create_distortion_grid_torch(H, W, K, dist_coeffs, *, align_corners=False,
     count = dist_coeffs.numel()
     k1 = dist_coeffs[0]
     k2 = dist_coeffs[1] if count >= 2 else zero
-    p1, p2, k3 = (dist_coeffs[2], dist_coeffs[3], dist_coeffs[4]) if count >= 5 else (zero, zero, zero)
-    fy, fx, cx, cy = K[1, 1], K[0, 0], K[0, 2], K[1, 2]
-    yy, xx = torch.meshgrid(torch.arange(H, device=K.device, dtype=torch.float32),
-                           torch.arange(W, device=K.device, dtype=torch.float32),
-                           indexing="ij")
-    xn, yn = (xx-cx)/fx, (yy-cy)/fy
+    if count >= 5:
+        p1, p2, k3 = dist_coeffs[2], dist_coeffs[3], dist_coeffs[4]
+    else:
+        p1, p2, k3 = zero, zero, zero
+    fy = K[1, 1]
+    fx = K[0, 0]
+    cx = K[0, 2]
+    cy = K[1, 2]
+    yy, xx = torch.meshgrid(
+        torch.arange(H, device=K.device, dtype=torch.float32),
+        torch.arange(W, device=K.device, dtype=torch.float32),
+        indexing="ij",
+    )
+    xn, yn = (xx - cx) / fx, (yy - cy) / fy
     if inverse:
         x, y = xn, yn
         for _ in range(iterations):
             radial, tx, ty = _distortion_terms(x, y, k1, k2, p1, p2, k3)
-            x, y = (xn-tx)/radial, (yn-ty)/radial
+            x, y = (xn - tx) / radial, (yn - ty) / radial
     else:
         radial, tx, ty = _distortion_terms(xn, yn, k1, k2, p1, p2, k3)
-        x, y = xn*radial+tx, yn*radial+ty
-    return _normal_grid(fx*x+cx, fy*y+cy, (H, W), aligned).unsqueeze(0)
+        x, y = xn * radial + tx, yn * radial + ty
+    return _normal_grid(fx * x + cx, fy * y + cy, (H, W), aligned).unsqueeze(0)
 
 
 def _float_tensor(value, device):
@@ -167,7 +194,9 @@ def _float_tensor(value, device):
 def _host_numpy(value, name):
     if isinstance(value, torch.Tensor):
         if value.device.type != "cpu":
-            raise TypeError(f"{name} must be CPU data; implicit device-to-host transfer is not allowed")
+            raise TypeError(
+                f"{name} must be CPU data; implicit device-to-host transfer is not allowed"
+            )
         value = value.detach().numpy()
     return np.asarray(value)
 
@@ -180,19 +209,84 @@ def _factor_kernel(kernel):
     """Validate a nonnegative rank-one kernel; return float32 factors or reason."""
     if not np.isfinite(kernel).all() or np.any(kernel < 0):
         return None, None, "kernel must be finite and nonnegative"
-    h, w = kernel.shape
+    height, width = kernel.shape
     work = kernel.astype(np.float64, copy=False)
     if not np.any(work):
-        ky, kx = np.zeros(h, np.float32), np.ones(w, np.float32)
+        ky = np.zeros(height, np.float32)
+        kx = np.ones(width, np.float32)
     else:
         row, column = np.unravel_index(np.argmax(work), work.shape)
         ky = work[:, column].astype(np.float32)
-        kx = (work[row, :]/work[row, column]).astype(np.float32)
-    reconstructed = ky[:, None]*kx[None, :]
-    error = float(np.max(np.abs(reconstructed.astype(np.float64)-kernel)))
+        kx = (work[row, :] / work[row, column]).astype(np.float32)
+    reconstructed = ky[:, None] * kx[None, :]
+    error = float(np.max(np.abs(reconstructed.astype(np.float64) - kernel)))
     if not np.allclose(reconstructed, kernel, rtol=1e-6, atol=1e-8):
         return None, error, "kernel is not rank one within rtol=1e-6, atol=1e-8"
     return (ky, kx), error, None
+
+
+def _sigma_cache_value(callback_sigma):
+    """Validate sigma without replacing the object passed to the kernel callback."""
+    sigma = callback_sigma
+    if isinstance(sigma, torch.Tensor):
+        if sigma.device.type != "cpu" or sigma.numel() != 1:
+            raise TypeError(
+                "motion_rate_to_sigma must return a CPU scalar; no implicit GPU synchronization"
+            )
+        sigma = sigma.detach().numpy().reshape(()).item()
+    if (
+        isinstance(sigma, (bool, np.bool_))
+        or not isinstance(sigma, Real)
+        or not math.isfinite(sigma)
+    ):
+        raise ValueError("motion_rate_to_sigma must return a finite real scalar sigma")
+    return sigma
+
+
+def _gaussian_kernel_array(callback_kernel):
+    """Validate the callback's CPU kernel, then convert it once to float32."""
+    original = _host_numpy(callback_kernel, "create_gaussian_kernel result")
+    if (
+        original.ndim != 2
+        or min(original.shape) < 1
+        or any(size % 2 == 0 for size in original.shape)
+    ):
+        raise ValueError("create_gaussian_kernel must return a nonempty 2-D kernel with odd H,W")
+    if original.dtype.kind != "f" or original.dtype.itemsize not in (4, 8):
+        raise TypeError("create_gaussian_kernel must return float32 or float64 CPU weights")
+    kernel = np.ascontiguousarray(original, dtype=np.float32)
+    if not np.isfinite(kernel).all():
+        raise ValueError("Gaussian kernel must remain finite after float32 conversion")
+    return kernel
+
+
+def _upload_motion_kernel(kernel_array, factor_arrays, device):
+    """Upload a shared ``[4,1,KH,KW]`` kernel and optional one-dimensional factors."""
+    kernel_height, kernel_width = kernel_array.shape
+    if factor_arrays is None:
+        return (
+            torch.from_numpy(kernel_array)
+            .to(device=device)
+            .reshape(1, 1, kernel_height, kernel_width)
+            .repeat(4, 1, 1, 1)
+        )
+
+    vertical, horizontal = factor_arrays
+    # Dense weights and factors share one transfer, as in the original path.
+    packed = torch.from_numpy(np.concatenate((kernel_array.ravel(), vertical, horizontal))).to(
+        device=device
+    )
+    dense_elements = kernel_height * kernel_width
+    kernel = packed[:dense_elements].reshape(1, 1, kernel_height, kernel_width).repeat(4, 1, 1, 1)
+    factors = (
+        packed[dense_elements : dense_elements + kernel_height],
+        packed[dense_elements + kernel_height :],
+    )
+    if __package__:
+        from .paste_shared_types import MotionKernelSpec
+    else:
+        from paste_shared_types import MotionKernelSpec
+    return MotionKernelSpec(kernel=kernel, factors=factors)
 
 
 class SharedParameterBuilder:
@@ -204,27 +298,42 @@ class SharedParameterBuilder:
     callback kernel. The full kernel is retained for reference/dense execution.
     """
 
-    def __init__(self, *, acceleration="triton", normalization="legacy",
-                 distortion_inverse=True, iterations=10, camera_index_policy="legacy",
-                 distortion_align_corners=False, enable_separable=False, cache_limit=16,
-                 cache_kernels=True, kernel_cache_version=0):
+    def __init__(
+        self,
+        *,
+        acceleration="triton",
+        normalization="legacy",
+        distortion_inverse=True,
+        iterations=10,
+        camera_index_policy="legacy",
+        distortion_align_corners=False,
+        enable_separable=False,
+        cache_limit=16,
+        cache_kernels=True,
+        kernel_cache_version=0,
+    ):
         if acceleration not in ("eager", "auto", "triton"):
             raise ValueError("acceleration must be 'eager', 'auto' or 'triton'")
         if normalization not in ("legacy", "matched"):
             raise ValueError("normalization must be 'legacy' or 'matched'")
         if camera_index_policy not in ("legacy", "corrected"):
             raise ValueError("camera_index_policy must be 'legacy' or 'corrected'")
-        for name, value in (("distortion_inverse", distortion_inverse),
-                            ("distortion_align_corners", distortion_align_corners),
-                            ("enable_separable", enable_separable), ("cache_kernels", cache_kernels)):
+        for name, value in (
+            ("distortion_inverse", distortion_inverse),
+            ("distortion_align_corners", distortion_align_corners),
+            ("enable_separable", enable_separable),
+            ("cache_kernels", cache_kernels),
+        ):
             if not isinstance(value, bool):
                 raise ValueError(f"{name} must be a bool")
-        self.acceleration, self.normalization = acceleration, normalization
+        self.acceleration = acceleration
+        self.normalization = normalization
         self.distortion_inverse = distortion_inverse
         self.iterations = _size(iterations, "iterations", minimum=0)
         self.camera_index_policy = camera_index_policy
         self.distortion_align_corners = distortion_align_corners
-        self.enable_separable, self.cache_kernels = enable_separable, cache_kernels
+        self.enable_separable = enable_separable
+        self.cache_kernels = cache_kernels
         self.cache_limit = _size(cache_limit, "cache_limit")
         self.kernel_cache_version = kernel_cache_version
         self.clear_cache()
@@ -236,9 +345,13 @@ class SharedParameterBuilder:
         self.last_info = {}
 
     def cache_info(self):
-        return {"entries": len(self._kernel_cache), "hits": self._kernel_hits,
-                "misses": self._kernel_misses, "limit": self.cache_limit,
-                "enabled": self.cache_kernels}
+        return {
+            "entries": len(self._kernel_cache),
+            "hits": self._kernel_hits,
+            "misses": self._kernel_misses,
+            "limit": self.cache_limit,
+            "enabled": self.cache_kernels,
+        }
 
     def _grid_backend(self, *tensors):
         if self.acceleration == "eager":
@@ -250,46 +363,63 @@ class SharedParameterBuilder:
         if paste_shared_kernels.supported(*tensors):
             return paste_shared_kernels
         if self.acceleration == "triton":
-            raise RuntimeError("SharedParameterBuilder acceleration='triton' requires Triton and float32 CUDA inference inputs; select 'eager' or 'auto' for a fallback")
+            raise RuntimeError(
+                "SharedParameterBuilder acceleration='triton' requires Triton and float32 CUDA inference inputs; select 'eager' or 'auto' for a fallback"
+            )
         return None
 
     @staticmethod
     def _device(value):
         if isinstance(value, bool):
             raise ValueError("device must be a torch device, device string or CUDA integer index")
-        device = torch.device("cuda", int(value)) if isinstance(value, Integral) else torch.device(value)
+        device = (
+            torch.device("cuda", int(value)) if isinstance(value, Integral) else torch.device(value)
+        )
         if device.type == "cuda" and device.index is None:
             device = torch.device("cuda", torch.cuda.current_device())
         return device
 
     def _motion_value(self, owner, motion_rate, device):
+        """Resolve callbacks once, reuse an exact cache entry or prepare its payload."""
         sigma_callback = getattr(owner, "motion_rate_to_sigma", None)
         kernel_callback = getattr(owner, "create_gaussian_kernel", None)
         if not callable(sigma_callback) or not callable(kernel_callback):
-            raise TypeError("owner.motion_rate_to_sigma and owner.create_gaussian_kernel must be callable")
+            raise TypeError(
+                "owner.motion_rate_to_sigma and owner.create_gaussian_kernel must be callable"
+            )
         callback_sigma = sigma_callback(motion_rate)
-        sigma = callback_sigma
-        if isinstance(sigma, torch.Tensor):
-            if sigma.device.type != "cpu" or sigma.numel() != 1:
-                raise TypeError("motion_rate_to_sigma must return a CPU scalar; no implicit GPU synchronization")
-            sigma = sigma.detach().numpy().reshape(()).item()
-        if isinstance(sigma, (bool, np.bool_)) or not isinstance(sigma, Real) or not math.isfinite(sigma):
-            raise ValueError("motion_rate_to_sigma must return a finite real scalar sigma")
+        sigma = _sigma_cache_value(callback_sigma)
         # Keep the actual scalar/type in the key: no quantization, including
         # callbacks whose float32/float64 argument types affect their results.
         sigma_key = float(sigma)
-        sigma_type = (type(callback_sigma), str(getattr(callback_sigma, "dtype", "")),
-                      tuple(callback_sigma.shape) if isinstance(callback_sigma, torch.Tensor) else None)
+        sigma_type = (
+            type(callback_sigma),
+            str(getattr(callback_sigma, "dtype", "")),
+            tuple(callback_sigma.shape) if isinstance(callback_sigma, torch.Tensor) else None,
+        )
         zero_sign = math.copysign(1.0, sigma) if sigma == 0 else None
         owner_version = getattr(owner, "gaussian_kernel_cache_version", 0)
         for version in (owner_version, self.kernel_cache_version):
             if isinstance(version, torch.Tensor):
-                raise TypeError("Gaussian cache versions must be hashable Python values, not tensors")
+                raise TypeError(
+                    "Gaussian cache versions must be hashable Python values, not tensors"
+                )
             hash(version)
-        sigma_identity, kernel_identity = _callback_identity(sigma_callback), _callback_identity(kernel_callback)
-        key = (id(owner), tuple(map(id, sigma_identity)), tuple(map(id, kernel_identity)),
-               sigma_type, type(sigma), sigma, zero_sign, str(device),
-               owner_version, self.kernel_cache_version, self.enable_separable)
+        sigma_identity = _callback_identity(sigma_callback)
+        kernel_identity = _callback_identity(kernel_callback)
+        key = (
+            id(owner),
+            tuple(map(id, sigma_identity)),
+            tuple(map(id, kernel_identity)),
+            sigma_type,
+            type(sigma),
+            sigma,
+            zero_sign,
+            str(device),
+            owner_version,
+            self.kernel_cache_version,
+            self.enable_separable,
+        )
         cached = self._kernel_cache.get(key) if self.cache_kernels else None
         if cached is not None:
             self._kernel_cache.move_to_end(key)
@@ -300,36 +430,24 @@ class SharedParameterBuilder:
         self._kernel_misses += 1
         # Preserve the callback's original sigma object/type; scalar conversion
         # above is for hashing/diagnostics only, never a new blur law.
-        original = _host_numpy(kernel_callback(callback_sigma), "create_gaussian_kernel result")
-        if original.ndim != 2 or min(original.shape) < 1 or any(size % 2 == 0 for size in original.shape):
-            raise ValueError("create_gaussian_kernel must return a nonempty 2-D kernel with odd H,W")
-        if original.dtype.kind != "f" or original.dtype.itemsize not in (4, 8):
-            raise TypeError("create_gaussian_kernel must return float32 or float64 CPU weights")
-        kernel_np = np.ascontiguousarray(original, dtype=np.float32)
-        if not np.isfinite(kernel_np).all():
-            raise ValueError("Gaussian kernel must remain finite after float32 conversion")
-        factor_np, factor_error, reason = _factor_kernel(kernel_np) if self.enable_separable else (None, None, "disabled")
-        info = dict(sigma=sigma_key, kernel_shape=tuple(kernel_np.shape),
-                    separable=factor_np is not None, factor_error=factor_error,
-                    separable_reason=reason)
-        self.last_info.update(info, kernel_cache_hit=False)
-        if self.enable_separable and factor_np is None:
-            raise ValueError(f"enable_separable=True: {reason}; max absolute factor error={factor_error!r}. Use enable_separable=False with a dense blur backend for this callback kernel.")
-        kh, kw = kernel_np.shape
-        if factor_np is None:
-            kernel = torch.from_numpy(kernel_np).to(device=device).reshape(1, 1, kh, kw).repeat(4, 1, 1, 1)
-            value = kernel
+        kernel_array = _gaussian_kernel_array(kernel_callback(callback_sigma))
+        if self.enable_separable:
+            factor_arrays, factor_error, reason = _factor_kernel(kernel_array)
         else:
-            ky, kx = factor_np
-            # One host-to-device transfer for dense reference weights + factors.
-            packed = torch.from_numpy(np.concatenate((kernel_np.ravel(), ky, kx))).to(device=device)
-            kernel = packed[:kh*kw].reshape(1, 1, kh, kw).repeat(4, 1, 1, 1)
-            factors = (packed[kh*kw:kh*kw+kh], packed[kh*kw+kh:])
-            if __package__:
-                from .paste_shared_types import MotionKernelSpec
-            else:
-                from paste_shared_types import MotionKernelSpec
-            value = MotionKernelSpec(kernel=kernel, factors=factors)
+            factor_arrays, factor_error, reason = None, None, "disabled"
+        info = dict(
+            sigma=sigma_key,
+            kernel_shape=tuple(kernel_array.shape),
+            separable=factor_arrays is not None,
+            factor_error=factor_error,
+            separable_reason=reason,
+        )
+        self.last_info.update(info, kernel_cache_hit=False)
+        if self.enable_separable and factor_arrays is None:
+            raise ValueError(
+                f"enable_separable=True: {reason}; max absolute factor error={factor_error!r}. Use enable_separable=False with a dense blur backend for this callback kernel."
+            )
+        value = _upload_motion_kernel(kernel_array, factor_arrays, device)
         if self.cache_kernels:
             # Hold identity objects so Python cannot recycle their IDs into a hit.
             self._kernel_cache[key] = (value, info, (owner, *sigma_identity, *kernel_identity))
@@ -338,25 +456,32 @@ class SharedParameterBuilder:
         return value
 
     @torch.inference_mode()
-    def prepare(self, owner, data_dict, frame_id, *, height, width, device,
-                mask_canvas, camera_result=None):
+    def prepare(
+        self, owner, data_dict, frame_id, *, height, width, device, mask_canvas, camera_result=None
+    ):
         """Build a six-item original paste_args tuple, explicitly once per frame.
 
         camera_result=None calls compute_camera_filter_shared exactly once.
         Otherwise supply (coefficients, motion_rate) from an earlier CPU call;
         this method will not filter again or rewrite data_dict coefficients.
-        Returned calibration tensors are float32 on device. Neither camera
-        results nor distortion grids are reused based on frame_id.
+        Returned calibration tensors are float32 on device. The distortion grid
+        is ``[1,H,W,2]``; the shared motion kernel is ``[4,1,KH,KW]`` or its
+        MotionKernelSpec wrapper. Neither camera results nor distortion grids
+        are reused based on frame_id.
         """
-        height, width = _size(height, "height"), _size(width, "width")
+        height = _size(height, "height")
+        width = _size(width, "width")
         device = self._device(device)
-        self.last_info = {"camera_filter_called": camera_result is None,
-                          "camera_index_policy": self.camera_index_policy,
-                          "normalization": self.normalization,
-                          "requested_acceleration": self.acceleration}
+        self.last_info = {
+            "camera_filter_called": camera_result is None,
+            "camera_index_policy": self.camera_index_policy,
+            "normalization": self.normalization,
+            "requested_acceleration": self.acceleration,
+        }
         if camera_result is None:
             filtered, motion_rate = compute_camera_filter_shared(
-                owner, data_dict, frame_id, index_policy=self.camera_index_policy)
+                owner, data_dict, frame_id, index_policy=self.camera_index_policy
+            )
         else:
             if not isinstance(camera_result, (tuple, list)) or len(camera_result) != 2:
                 raise ValueError("camera_result must be (dist_coeffs_filtered, motion_rate)")
@@ -364,18 +489,45 @@ class SharedParameterBuilder:
         K = _float_tensor(data_dict["K"], device)
         coefficients = _float_tensor(filtered, device)
         backend = self._grid_backend(K, coefficients)
-        grid_fn = create_distortion_grid_torch if backend is None else backend.build_distortion_grid_gpu
-        distortion = grid_fn(height, width, K, coefficients,
-                            align_corners=self.distortion_align_corners,
-                            inverse=self.distortion_inverse, iterations=self.iterations,
-                            normalization=self.normalization)
+        build_distortion = (
+            create_distortion_grid_torch if backend is None else backend.build_distortion_grid_gpu
+        )
+        distortion = build_distortion(
+            height,
+            width,
+            K,
+            coefficients,
+            align_corners=self.distortion_align_corners,
+            inverse=self.distortion_inverse,
+            iterations=self.iterations,
+            normalization=self.normalization,
+        )
         self.last_info["effective_grid_backend"] = "torch" if backend is None else "triton"
         motion_value = self._motion_value(owner, motion_rate, device)
         return device, distortion, coefficients, motion_value, mask_canvas, None
 
+    def _prepare_warp_matrices(self, raw_matrices, device):
+        """Batch ordinary CPU 3x3 matrices into one transfer; keep other inputs live."""
+        all_host = all(
+            not isinstance(value, torch.Tensor) or value.device.type == "cpu"
+            for value in raw_matrices
+        )
+        host_matrices = None
+        if all_host:
+            host_matrices = [
+                _host_numpy(value, f"m_inv[{index}]") for index, value in enumerate(raw_matrices)
+            ]
+        if all_host and all(matrix.shape == (3, 3) for matrix in host_matrices):
+            packed = _float_tensor(np.stack(host_matrices).astype(np.float32, copy=False), device)
+            matrices = tuple(packed[index] for index in range(len(raw_matrices)))
+            self.last_info["warp_host_matrix_batches"] = 1
+        else:
+            matrices = tuple(_float_tensor(value, device) for value in raw_matrices)
+            self.last_info["warp_host_matrix_batches"] = len(raw_matrices) if all_host else None
+        return matrices
+
     @torch.inference_mode()
-    def build_warp_grids(self, *, params, ads, boxes, device, batch,
-                         warp_align_corners, **kwargs):
+    def build_warp_grids(self, *, params, ads, boxes, device, batch, warp_align_corners, **kwargs):
         """Bulk adapter hook: return one current ROI grid per advertisement slot.
 
         Source H,W come from actual collected ads, never ad_h_w. All-CPU [3,3]
@@ -388,22 +540,15 @@ class SharedParameterBuilder:
         batch = _size(batch, "batch")
         device = self._device(device)
         if kwargs.get("matrix_coordinates") not in (None, "roi"):
-            raise ValueError("SharedParameterBuilder uses original ROI-local m_inv; matrix_coordinates must be 'roi'")
+            raise ValueError(
+                "SharedParameterBuilder uses original ROI-local m_inv; matrix_coordinates must be 'roi'"
+            )
         if not isinstance(warp_align_corners, bool):
             raise ValueError("warp_align_corners must be a bool")
         if not params:
             return ()
         raw_matrices = [param["m_inv"] for param in params]
-        all_host = all(not isinstance(value, torch.Tensor) or value.device.type == "cpu"
-                       for value in raw_matrices)
-        host_matrices = [_host_numpy(value, f"m_inv[{i}]") for i, value in enumerate(raw_matrices)] if all_host else None
-        if all_host and all(matrix.shape == (3, 3) for matrix in host_matrices):
-            packed = _float_tensor(np.stack(host_matrices).astype(np.float32, copy=False), device)
-            matrices = tuple(packed[i] for i in range(len(params)))
-            self.last_info["warp_host_matrix_batches"] = 1
-        else:
-            matrices = tuple(_float_tensor(value, device) for value in raw_matrices)
-            self.last_info["warp_host_matrix_batches"] = len(raw_matrices) if all_host else None
+        matrices = self._prepare_warp_matrices(raw_matrices, device)
         grids = []
         for i, (ad, box, matrix) in enumerate(zip(ads, boxes, matrices)):
             if not isinstance(ad, torch.Tensor) or ad.ndim != 4 or ad.shape[:2] != (batch, 4):
@@ -413,16 +558,26 @@ class SharedParameterBuilder:
                 raise ValueError(f"m_inv[{i}] must be [3,3] or [1|B,3,3]")
             if matrix.ndim == 3 and matrix.shape[0] not in (1, batch):
                 raise ValueError(f"m_inv[{i}] batch must be 1 or {batch}")
-            if not isinstance(box, (tuple, list)) or len(box) != 4 or any(
-                isinstance(v, (bool, np.bool_)) or not isinstance(v, Integral) for v in box):
+            if (
+                not isinstance(box, (tuple, list))
+                or len(box) != 4
+                or any(isinstance(v, (bool, np.bool_)) or not isinstance(v, Integral) for v in box)
+            ):
                 raise ValueError(f"boxes[{i}] must contain four integer coordinates")
             x1, y1, x2, y2 = map(int, box)
-            roi_hw = _hw((y2-y1, x2-x1), f"ROI[{i}]")
+            roi_hw = _hw((y2 - y1, x2 - x1), f"ROI[{i}]")
             backend = self._grid_backend(matrix)
-            grid_fn = create_roi_grid_torch if backend is None else backend.build_roi_grid_gpu
-            grids.append(grid_fn(source_hw, matrix, roi_hw,
-                                 align_corners=warp_align_corners,
-                                 normalization=self.normalization, eps=1e-8))
+            build_roi = create_roi_grid_torch if backend is None else backend.build_roi_grid_gpu
+            grids.append(
+                build_roi(
+                    source_hw,
+                    matrix,
+                    roi_hw,
+                    align_corners=warp_align_corners,
+                    normalization=self.normalization,
+                    eps=1e-8,
+                )
+            )
         self.last_info["warp_grid_slots"] = len(grids)
         return tuple(grids)
 

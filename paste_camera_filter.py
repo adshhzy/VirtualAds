@@ -91,6 +91,40 @@ def _median_row_reflect(values, index, size):
     return np.partition(window, radius, axis=0)[radius].copy()
 
 
+def _select_neighbor_row(neighbors, frame_id, index_policy, legacy_index):
+    """Choose a sorted history row without changing either index policy."""
+    if index_policy == "corrected":
+        index = next((i for i, item in enumerate(neighbors) if item[0] == frame_id), None)
+        if index is None:
+            raise ValueError(
+                f"current frame {frame_id} is absent from eligible camera history; "
+                "cannot select its filtered coefficients"
+            )
+        return index
+
+    if legacy_index >= len(neighbors):
+        raise IndexError(
+            f"legacy current_index={legacy_index} is out of range for {len(neighbors)} "
+            f"neighbors because current frame {frame_id} is absent"
+        )
+    return legacy_index
+
+
+def _stack_neighbor_coefficients(neighbors):
+    """Return CPU coefficients ``[neighbors, coefficients]`` and unchanged poses."""
+    vectors = []
+    poses = []
+    coefficient_shape = None
+    for key, pose, coefficients in neighbors:
+        vector = _coefficient_vector(coefficients, f"paste_data_stack[{key}]['dist_coeffs']")
+        if coefficient_shape is not None and vector.shape != coefficient_shape:
+            raise ValueError("neighbor coefficient vectors must have the same length")
+        coefficient_shape = vector.shape
+        vectors.append(vector)
+        poses.append(pose)
+    return np.stack(vectors), poses
+
+
 def compute_camera_filter_shared(
     owner,
     data_dict,
@@ -166,35 +200,12 @@ def compute_camera_filter_shared(
     if len(neighbors) < 3:
         return fallback, 0.0
 
-    if index_policy == "corrected":
-        index = next((i for i, item in enumerate(neighbors) if item[0] == frame_id), None)
-        if index is None:
-            raise ValueError(
-                f"current frame {frame_id} is absent from eligible camera history; "
-                "cannot select its filtered coefficients"
-            )
-    else:
-        index = legacy_index
-        if index >= len(neighbors):
-            raise IndexError(
-                f"legacy current_index={index} is out of range for {len(neighbors)} "
-                f"neighbors because current frame {frame_id} is absent"
-            )
-
+    index = _select_neighbor_row(neighbors, frame_id, index_policy, legacy_index)
     motion_callback = getattr(owner, "compute_camera_motion_rate", None)
     if not callable(motion_callback):
         raise TypeError("owner.compute_camera_motion_rate must be callable")
-    vectors, poses = [], []
-    coefficient_shape = None
-    for key, pose, coefficients in neighbors:
-        vector = _coefficient_vector(coefficients, f"paste_data_stack[{key}]['dist_coeffs']")
-        if coefficient_shape is not None and vector.shape != coefficient_shape:
-            raise ValueError("neighbor coefficient vectors must have the same length")
-        coefficient_shape = vector.shape
-        vectors.append(vector)
-        poses.append(pose)
-    stacked = np.stack(vectors)
-    filtered = _median_row_reflect(stacked, index, median_size)
+    coefficients, poses = _stack_neighbor_coefficients(neighbors)
+    filtered = _median_row_reflect(coefficients, index, median_size)
     data_dict["dist_coeffs"] = filtered
     motion_rate = motion_callback(poses)
     return filtered, motion_rate

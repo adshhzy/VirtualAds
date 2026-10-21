@@ -1,6 +1,11 @@
-# GPU 广告贴图 perf4.2：动态路数
+# GPU 广告贴图库
 
-这是 PyTorch / Triton GPU 贴图库和命令行基准程序，没有 Web 服务或浏览器界面。当前本地版本为 `2026-10-21-perf4.2-dynamic`，位于 `E:\dev\virtualAds\paste_gpu_performance`。本轮新增动态路数执行策略、计算与NumPy回传重叠、可独立配置的横纵模糊核，以及严格数值回归。结果、启用范围和复现命令见 [DYNAMIC_BATCH_REVIEW.md](DYNAMIC_BATCH_REVIEW.md)。
+这是 PyTorch / Triton GPU 贴图库和命令行基准程序，没有 Web 服务或浏览器界面。当前本地版本为 `2026-10-21-perf4.2-readable`，位于 `E:\dev\virtualAds\paste_gpu_performance`。
+
+本轮完成职责拆分、命名与格式整理、基准工具去重，保留原业务接口、画面语义和动态路数策略。
+先读 [代码阅读与修改指南](ARCHITECTURE.md)，再看 [重构验收记录](READABILITY_REVIEW.md)。动态路数优化的启用范围和历史结果见 [DYNAMIC_BATCH_REVIEW.md](DYNAMIC_BATCH_REVIEW.md)。
+
+格式与静态检查：`.\scripts\lint.ps1`；自动格式化后检查：`.\scripts\lint.ps1 -Fix`。工具使用独立 uv 环境，不改 GPU 依赖。
 
 原包基线来自[最新分享会话](https://chatgpt.com/share/6ad82a9c-6d28-83ec-a454-ff17371706f4)的 `paste_gpu_performance_perf4_1.zip`，SHA256 为 `c1fbb5865f284d13b57cff251c6e11130add09b7af8f76e60fc3feae1c28a43a`。同步时13个原包文件逐字节校验，保存于Git提交 `0b97beb`；当前文件包含之后的本地优化，不再宣称与压缩包逐字节一致。历史记录见 [PERF4_1_REVIEW.md](PERF4_1_REVIEW.md)。
 

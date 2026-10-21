@@ -2,12 +2,13 @@
 
 ## 项目与运行
 
-- 这是 Python GPU 库和命令行基准，没有 Web 服务。当前本地版本 `2026-10-21-perf4.2-dynamic`。原包 perf4.1 基线为 `0b97beb`；最初 perf4 为 `480fad5`。动态路数变更与实测见 `DYNAMIC_BATCH_REVIEW.md`。
+- 这是 Python GPU 库和命令行基准，没有 Web 服务。当前本地版本 `2026-10-21-perf4.2-readable`。原包 perf4.1 基线为 `0b97beb`；最初 perf4 为 `480fad5`。动态路数优化基线为 `fe07b03`，本轮仅可读性重构，验收见 `READABILITY_REVIEW.md`。
 - 默认解释器：`E:\dev\virtualAds\env\paste_gpu_performance\Scripts\python.exe`。不要直接用系统 Python，也不要修改其他项目的环境。
 - 使用 `scripts/setup.ps1` 从 `requirements-lock.txt` 安装依赖；torch 独立使用官方 cu128 源。依赖调整应同步锁文件并验证 CUDA / Triton 兼容。
 - `scripts/run.ps1 shared ...` 对应 `benchmark_shared_paste.py`；`scripts/run.ps1 batch ...` 对应 `benchmark_paste_gpu_batch.py`。
 - `shared_paste_example.py` 展示业务接入；`paste_gpu_batch_adapter.py` 负责接口、素材缓存和输出，`paste_gpu_batch.py` 负责核心路由。共享参数逻辑位于 `paste_shared_params.py` / `paste_camera_filter.py`，GPU 内核在 `paste_*_kernels.py`。
-- 优先阅读 `README.md` 和 `DYNAMIC_BATCH_REVIEW.md`；`PERF4_1_REVIEW.md`、`SHARED_PIPELINE_README.md` 和 `paste_gpu_performance_README.txt` 保留历史说明。日志、输出和缓存不提交 Git。
+- 优先阅读 `README.md`、`ARCHITECTURE.md` 和 `READABILITY_REVIEW.md`；`DYNAMIC_BATCH_REVIEW.md` 记录现行调度策略的历史测量，其余 review/validation 文档保留历史说明。日志、输出和缓存不提交 Git。
+- 用 `.\scripts\lint.ps1` 检查格式与静态问题；`-Fix` 仅统一格式再检查。Ruff 0.14.1/100列/LF/Python3.9语法目标，配置在 `pyproject.toml`，工具隔离于GPU环境。保留平铺导入路径；优先按已有阶段职责放置helper，不引入只为包装参数的层层对象。
 
 ## 必须保持的行为
 
