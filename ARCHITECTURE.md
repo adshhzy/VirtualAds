@@ -1,8 +1,8 @@
 # 代码阅读与修改指南
 
-当前版本 `2026-10-21-perf4.4-bucketed`。这是 GPU 贴图库和基准工具，不含视频解码、编码、推流或常驻服务。
+当前版本 `2026-10-21-perf4.5-streaming`。这是 GPU 贴图库和基准工具，不含视频解码、编码、推流或常驻服务。
 这里的 **B（路数）是同一画面/布局下的素材组数**；每组产生一张结果，不等同于任意独立摄像机的并发数。
-最新测量、最终判断及验收见 [BUCKETED_OPTIMIZATION_REVIEW.md](BUCKETED_OPTIMIZATION_REVIEW.md)；[BACKEND_COMPARISON_REVIEW.md](BACKEND_COMPARISON_REVIEW.md) 保留上一轮旧桶观察。
+本轮直播资源生命周期、测量方法及验收状态见 [STREAMING_REVIEW.md](STREAMING_REVIEW.md)。[BUCKETED_OPTIMIZATION_REVIEW.md](BUCKETED_OPTIMIZATION_REVIEW.md) 保留 perf4.4 桶优化结果；[BACKEND_COMPARISON_REVIEW.md](BACKEND_COMPARISON_REVIEW.md) 保留更早的旧桶观察。
 
 ## 先从哪里读
 
@@ -34,10 +34,11 @@ flowchart TD
 | 文件 | 负责什么 | 适合在这里修改什么 |
 |---|---|---|
 | `shared_paste_example.py` | 业务对象接入，初始化 builder/adapter | worker 接入方式 |
-| `paste_camera_filter.py` | CPU 相机历史选择、滤波、调用业务运动估计 | 相机数据校验和滤波；行为变更须单独验收 |
+| `paste_camera_filter.py` | CPU 相机历史选择、滤波、可选有界历史容器 | 相机数据校验、历史生命周期；滤波行为变更须单独验收 |
 | `paste_shared_params.py` | 共享畸变网格、ROI 网格、精确 sigma 核缓存 | 共享准备和缓存实现 |
 | `paste_shared_types.py` | `MotionKernelSpec`：二维核与已验证的一维因子 | 共享数据契约 |
 | `paste_gpu_batch_adapter.py` | 输入布局、素材缓存、执行编排、NumPy 所有权 | 业务接口适配和输出策略 |
+| `paste_asset_cache.py` | 历史素材 stack 的尺寸/条目/字节 LRU 与源身份引用 | 缓存预算、revision 清理和保留量诊断 |
 | `paste_execution_policy.py` | 离线实测配置的匹配与回退 | 新硬件/布局/B 的实测策略 |
 | `paste_gpu_batch.py` | 纯 Tensor 贴图流程，batch/bucketed，后端路由 | GPU 阶段组织和参考路径 |
 | `paste_gpu_kernels.py` | Triton ROI 采样、融合、dense 模糊 | 对应数值内核 |
@@ -75,6 +76,10 @@ flowchart TD
 GPU 核心先按广告位顺序覆盖 RGBA 画布，再做全图畸变、模糊、背景/mask 融合和 uint8 转换。
 `_finish_canvas` 明确区分 `torch`、dense `triton` 和 `separable` 三条模糊路径。
 不可交换 ROI 写入顺序、alpha 运算顺序或模糊位置，它们会改变画面。
+
+输入的局部形状、广播和设备契约由对应准备阶段校验，adapter 不再在进入 core 前重复扫描同一组已准备 Tensor。独立调用 core 的代码仍须使用公开 `validate_inputs()`。素材图像和 mask/透明度的布局计划只缓存 shape、布局和排列/广播操作等 CPU 元数据；缓存不保存这些动态 map 的值，每次仍应用于当前输入。
+
+batch core 已逐 slot 判断 Triton 支持条件和 padding 模式后，使用私有 `_warp_paste_into_supported` 启动，省去公开包装器的重复支持检查。公开 `warp_paste_into` 仍保留检查；两条入口共用同一展开、stride、启动参数和设备数学。业务代码应调用公开 API，不直接调用这个私有入口。
 
 ### batch、bucketed 与分块分别合并什么
 
@@ -129,18 +134,25 @@ Tensor 的 stride 和广播视图有实际性能意义，不要为了整洁随�
 
 ## 缓存与输出生命周期
 
-- 素材缓存由尺寸、素材身份、版本、设备、B 等区分；原地修改素材后递增 `imgs_raw_version` 或显式失效。
-- 尺寸缓存保存各广告位已整理的 `[B,4,h,w]` 素材，`batch` 同样使用它；缓存命中不表示启用了 `bucketed` 计算分桶。
+- 素材 key 区分有序源身份、版本、设备、B、shape/dtype 和 resize 等配置；原地修改素材后递增 `imgs_raw_version` 或显式失效。revision 精确变化时清旧代历史与当前工作集，不把每个视频帧版本永久留在 LRU 中。
+- `paste_asset_cache.py` 的历史 stack 默认受 `max_cached_bytes=512*1024*1024`、`max_cached_sizes` 和 `max_entries_per_size` 三种限制。设字节预算为 0 不保留历史，但仍可复用当前完整素材工作集；`cache_ads=False` 或 revision 为 `None` 才禁用素材复用。
+- 当前 `[B,4,h,w]` 工作集独立保留，可超过历史预算；其中同一 Tensor 可能同时被 LRU 引用，并非复制两份。历史条目与当前工作集均强引用对应源对象，防止 Python 复用 `id` 导致错误命中。源对象的底层存储不计入历史 stack 预算，因此预算不等于总内存上限。
+- 尺寸缓存是已整理素材的复用，`batch` 同样使用它；缓存命中不表示启用了 `bucketed` 计算分桶。
 - `bucketed` 只保留当前一份素材打包缓存，key 为素材 key 加有序桶成员。bbox、ROI 容量或 LUT 变化仍重建布局，但分组不变时复用打包素材；`area_caps` 导致成员分组变化时必须重打包。
 - 素材身份/版本、设备、B、源尺寸或顺序变化，以及显式失效、素材缓存 miss，仍使桶素材失效；禁用素材缓存时每帧重打包。grid/透明度始终实时打包，不复用旧几何。
-- Gaussian 核按精确 sigma 和回调/配置版本缓存；没有 sigma 量化。相同 `frame_id` 的 K、畸变、矩阵仍可能变化，因此不缓存整帧几何值。
-- 每次 NumPy 输出拥有独立存储。固定页路径直接返回 host Tensor 的 NumPy 视图，数组持有其底层 Tensor。
+- Gaussian 核在当前 owner/回调/配置版本/device 上下文中按精确 sigma 缓存，默认最多 16 项；切换上下文时清旧项与旧 owner 引用。持续变化的 sigma 仍可能每帧 miss，不量化 sigma 或替换真实回调。相同 `frame_id` 的 K、畸变、矩阵仍可能变化，因此不缓存整帧几何值。
+- `BoundedCameraHistory` 由业务显式创建一次、按单调帧号添加独立记录，过滤器仅对此类型按邻域直接查询。容量计记录数；默认半径 4 的最新帧至少需 5 条，含四帧前瞻的完整窗口至少需 9 条。普通 Mapping 保留完整遍历、全部 key 校验和原滤波规则，库不主动删除外部历史。seek/换流时显式 `reset()`。
+- 每次 NumPy 输出拥有独立存储。固定页路径直接返回 host Tensor 的 NumPy 视图，数组持有其底层 Tensor；最后一个引用释放后，PyTorch 分配器才能回收复用存储。下游输出队列必须有容量上限，旧数组仍被业务持有时库不能回收它。
 - 分块路径仍在调用方计算流串行计算；内部复制流等对应事件后复制。GPU 源和 host 结果一直存活到复制完成，正常返回与异常退出都同步复制流。
 - 每个 worker 使用自己的实例，调用方按同一计算流串行调用。跨流生产输入需先建立依赖。
 
+在两次调用之间或 worker 退出时，`builder.release_resources()` 清 Gaussian 缓存、上下文身份引用与统计；`adapter.release_resources()` 等待内部复制流完成，清素材、布局、map 缓存、事件/复制流引用与诊断状态。它们均可随后重新使用，不清业务历史、不覆盖旧输出、不调用全局 `empty_cache()`。`invalidate_assets()` 只用于素材失效，不能代替完整 worker 释放。业务还需释放自己持有的输入、队列及 `history`。
+
+`cache_info()` 的 `bytes` 是历史 stack 逻辑字节数，`current_bytes`/`bucket_bytes` 分别记录当前素材和桶素材，`retained_stack_bytes` 对三者的 Tensor 引用去重；不要直接把前三者相加。计数不含源 storage、LUT、临时工作区、输出或分配器保留量。检查长期增长需同时观察进程内存、CUDA allocated/reserved、固定页分配器和业务保留队列；`reserved` 高于 `allocated` 或释放后工作集未立即下降，本身不能证明泄漏。
+
 `batch_chunk_size="auto"` 只匹配离线表；`0` 整批；正整数手动分块。默认后端仍为 `batch`，也不强行启用可分离模糊。
 当前策略表沿用上一版：新增分块档位限定在 B8/B16、4/16 广告位、已测源尺寸循环、108×320 ROI 等条件内，继续检查既有硬件、软件和 Tensor 布局。
-精确准入表及最终判断以 [paste_execution_policy.py](paste_execution_policy.py) 和 [最新报告](BUCKETED_OPTIMIZATION_REVIEW.md) 为准，不能从广告位数或 B 单独推断；32 广告位不在此承诺内。
+精确准入表以 [paste_execution_policy.py](paste_execution_policy.py) 为准，不能从广告位数或 B 单独推断；32 广告位不在此承诺内。本轮直播整理未改动策略表。
 [动态路数报告](DYNAMIC_BATCH_REVIEW.md) 保留早期策略的历史测量。
 
 ## 基准与回归工具
@@ -151,6 +163,8 @@ Tensor 的 stride 和广播视图有实际性能意义，不要为了整洁随�
 | `scripts/run.ps1 backends` | `benchmark_backend_comparison.py` | 同输入、独立实例的 batch 与当前/旧 bucketed 完整调用对比；含动态 bbox、打包和布局更新 |
 | `scripts/run.ps1 check-backends` | `check_backend_contracts.py` | 布局归属、透明覆盖、广播输入、动态几何/素材缓存及旧输出所有权对照 |
 | `scripts/run.ps1 check-policy` | `test_backend_policy.py` | CPU 元数据测试；验证自动策略完整结构匹配、未知输入回退及原有档位优先 |
+| `scripts/run.ps1 check-streaming` | `check_streaming_stability.py` | 持续输入变化、历史/缓存/输出保留与释放后的资源采样；不代替生产负载验收 |
+| 项目 Python `-m unittest test_streaming_history test_streaming_lifecycle` | 两个 CPU 生命周期测试 | 相机邻域数值、历史容量、revision/owner 释放、预算与元数据缓存 |
 | `scripts/run.ps1 batch` | `benchmark_paste_gpu_batch.py` | 核心、adapter、dense 内核及诊断 |
 | `scripts/run.ps1 check` | `test_dynamic_batch.py` | 广播、尾块、动态 B、缓存和输出生命周期 |
 | `scripts/run.ps1 compare` | `benchmark_dynamic_comparison.py` | 隔离加载旧源码，对照当前完整调用；`--slots` 指定广告位数，默认 16 |
@@ -161,7 +175,7 @@ Tensor 的 stride 和广播视图有实际性能意义，不要为了整洁随�
 基准使用合成运动/sigma/Gaussian 回调，不代表真实业务。不要把独立阶段计时相加，也不要把跨轮数字当收益。
 
 上一轮旧 bucketed 的 108 场景筛查中，104 个场景最大差 1 级 uint8，另外 4 个逐字节一致场景更慢。
-该历史观察见 [BACKEND_COMPARISON_REVIEW.md](BACKEND_COMPARISON_REVIEW.md)，不能作为当前内核与缓存实现的结论；本轮结果见 [BUCKETED_OPTIMIZATION_REVIEW.md](BUCKETED_OPTIMIZATION_REVIEW.md)。
+该历史观察见 [BACKEND_COMPARISON_REVIEW.md](BACKEND_COMPARISON_REVIEW.md)，不能作为当前内核与缓存实现的结论；perf4.4 结果见 [BUCKETED_OPTIMIZATION_REVIEW.md](BUCKETED_OPTIMIZATION_REVIEW.md)，本轮直播测试状态见 [STREAMING_REVIEW.md](STREAMING_REVIEW.md)。
 
 `backends` 的计时从共享准备开始，到独立 NumPy 返回且 GPU 完成为止；只把合成源输入更新放在计时外。
 各候选持有独立 builder/adapter 和可变相机状态，并在下一次返回前保留上一次输出。
@@ -202,4 +216,4 @@ Tensor 的 stride 和广播视图有实际性能意义，不要为了整洁随�
 
 新增处理优先放在负责该阶段的现有函数附近。内核保留数学坐标和 stride 命名；host 代码使用能说明职责的名称。
 更改执行策略必须补完整 NumPy 对照；更改数值核必须补原算法/旧源码对照，不依靠逐轮放宽容差。
-本轮验收见 [BUCKETED_OPTIMIZATION_REVIEW.md](BUCKETED_OPTIMIZATION_REVIEW.md)；此前后端对比与可读性重构记录分别保留在 [BACKEND_COMPARISON_REVIEW.md](BACKEND_COMPARISON_REVIEW.md) 和 [READABILITY_REVIEW.md](READABILITY_REVIEW.md)。
+本轮验收状态见 [STREAMING_REVIEW.md](STREAMING_REVIEW.md)；此前桶优化、后端对比和可读性重构记录分别保留在 [BUCKETED_OPTIMIZATION_REVIEW.md](BUCKETED_OPTIMIZATION_REVIEW.md)、[BACKEND_COMPARISON_REVIEW.md](BACKEND_COMPARISON_REVIEW.md) 和 [READABILITY_REVIEW.md](READABILITY_REVIEW.md)。

@@ -204,7 +204,7 @@ def paste_gpu_batch(
         if accelerator is not None and warp_padding_mode in ("zeros", "border"):
             slot_accelerator = _select_accelerator(acceleration, source, grid, opacity, canvas)
             if slot_accelerator is not None:
-                slot_accelerator.warp_paste_into(
+                slot_accelerator._warp_paste_into_supported(
                     source,
                     grid,
                     opacity,

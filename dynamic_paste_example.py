@@ -3,13 +3,17 @@
 The caller supplies its existing owner and real camera/motion/Gaussian callbacks.
 Use a separate owner per worker and call it serially on one CUDA compute stream.
 This module does not generate camera history, replace callbacks, or send images.
+For bounded live history, the business creates BoundedCameraHistory once, writes
+each real camera record before rendering, and explicitly resets it on a seek.
 """
 
 from dataclasses import replace
 
 if __package__:
+    from .shared_paste_example import BoundedCameraHistory as BoundedCameraHistory
     from .shared_paste_example import prepare_shared_paste_args, setup_shared_paste
 else:
+    from shared_paste_example import BoundedCameraHistory as BoundedCameraHistory
     from shared_paste_example import prepare_shared_paste_args, setup_shared_paste
 
 
@@ -22,6 +26,8 @@ def initialize_dynamic_worker(owner, base_options, *, use_separable=False, max_c
     Set use_separable=True only after validating the real business kernel.
     Dense mode still supports changing B; auto chunking currently requires the
     measured separable configuration. No synthetic Gaussian callback is installed.
+    Create history once separately: ``history = BoundedCameraHistory(capacity=9)``.
+    Initialization does not convert, truncate or clear an existing business history.
     """
     return setup_shared_paste(
         owner,
@@ -60,6 +66,14 @@ def render_dynamic_frame(
     the current frame when filtering at least three eligible records; median
     coefficients must be CPU data. Data preparation may replace
     data_dict['dist_coeffs']; use a fresh frame dictionary when retaining raw data.
+    A BoundedCameraHistory is optional: add ``history[frame_id] = camera_record``
+    before this call in monotonic order. The record must contain the real CPU
+    coefficients and K/w2c; it is held by reference, so copy producer buffers if
+    they will be overwritten. With radius 4, retain at least 5 records for latest
+    frame filtering, or 9 for a centered window with four future frames. Sparse
+    histories may still take the original fewer-than-three-neighbors fallback.
+    A seek/new stream requires history.reset() and builder.clear_cache(); this
+    function never evicts records from an external ordinary mapping.
 
     The scheduler should skip this call for B=0. An empty ad_params list instead
     means B requested background outputs; the adapter bypasses shared preparation.
@@ -84,3 +98,15 @@ def render_dynamic_frame(
         owner, frame_input, data_dict, frame_id, mask_canvas, device=device
     )
     return adapter(owner, frame_input, data_dict, frame_id, way_id, paste_args)
+
+
+# Worker setup, once:
+# builder = initialize_dynamic_worker(owner, existing_options)
+# history = BoundedCameraHistory(capacity=9)
+# Each incoming frame, including frames skipped by the rendering scheduler:
+# history[frame_id] = {"K": current_K, "w2c": current_w2c,
+#                      "dist_coeffs": current_cpu_coefficients}
+# output = render_dynamic_frame(..., camera_history=history, ...)
+# On shutdown, after the last render returns:
+# builder.release_resources()
+# history.clear()

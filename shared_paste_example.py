@@ -11,10 +11,12 @@ if __package__:
     from .paste_gpu_batch_adapter import PasteBatchAdapter, _image_plan
     from .paste_shared_params import SharedParameterBuilder
     from .paste_camera_filter import compute_camera_filter_shared as compute_camera_filter_shared
+    from .paste_camera_filter import BoundedCameraHistory as BoundedCameraHistory
 else:
     from paste_gpu_batch_adapter import PasteBatchAdapter, _image_plan
     from paste_shared_params import SharedParameterBuilder
     from paste_camera_filter import compute_camera_filter_shared as compute_camera_filter_shared
+    from paste_camera_filter import BoundedCameraHistory as BoundedCameraHistory
 
 
 def setup_shared_paste(
@@ -32,6 +34,11 @@ def setup_shared_paste(
     Set use_separable only after the benchmark and the REAL callback's generated
     kernels pass validation. Dense triton supports odd kernel sizes <=15;
     separable triton supports verified rank-one shared kernels, odd sizes <=63.
+    This helper does not replace or trim owner.paste_data_stack. For a live
+    stream, explicitly create a BoundedCameraHistory once and add each raw camera
+    record before preparation. Keep ordinary mappings for existing history rules.
+    At shutdown call builder.release_resources(); it releases kernel/owner
+    references but leaves caller-owned history and previously returned data alone.
     """
     builder = SharedParameterBuilder(
         acceleration="triton",
@@ -110,3 +117,17 @@ def prepare_shared_paste_args(
 # Multiple devices:
 # camera_result = compute_camera_filter_shared(self, data_dict, frame_id, index_policy="legacy")
 # ... each device's builder.prepare(..., camera_result=camera_result) ...
+#
+# Optional bounded live history, created once by the business (not per frame):
+# camera_history = BoundedCameraHistory(capacity=9)
+# self.paste_data_stack = camera_history
+# ... each frame, in increasing ID order, BEFORE shared preparation ...
+# camera_history[frame_id] = {
+#     "K": current_K, "w2c": current_w2c, "dist_coeffs": current_cpu_coefficients,
+# }
+# Use a separate record dict from data_dict if retaining unfiltered coefficients.
+# Copy producer-owned arrays at ingestion if their storage will be overwritten.
+# Radius 4 needs 5 retained records when rendering the latest frame, or 9 for
+# a centered window with 4-frame lookahead. Delayed consumers need more capacity.
+# For a seek/new camera stream: camera_history.reset(); builder.clear_cache().
+# At worker shutdown: builder.release_resources(); camera_history.clear().

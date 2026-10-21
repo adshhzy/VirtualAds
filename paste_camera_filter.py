@@ -20,6 +20,7 @@ actually used in the NumPy median must be on CPU. Fallback coefficients and w2c
 poses are passed through without inspecting their values or changing devices.
 """
 
+from collections import OrderedDict
 from collections.abc import Mapping, MutableMapping
 from numbers import Integral
 
@@ -33,6 +34,81 @@ def _integer(value, name, *, minimum=None):
     if minimum is not None and result < minimum:
         raise ValueError(f"{name} must be >= {minimum}")
     return result
+
+
+class BoundedCameraHistory(MutableMapping):
+    """A worker-owned, bounded history for a monotonically advancing live stream.
+
+    Write ``history[frame_id] = record`` in increasing frame order. Replacing the
+    latest frame is allowed; an older ID requires an explicit ``reset()`` first
+    (for a seek or a new stream). Records are retained by reference, not copied.
+    Deleting a record does not rewind the latest ID; ``clear()`` also resets it.
+
+    Capacity counts records, not frame IDs. For a dense +/-4 window, capacity 9
+    covers filtering the center when up to four future records are already
+    present. Filtering the latest frame needs at least 5 records for its past
+    radius 4. A larger lookahead or delayed consumer needs more capacity. Sparse
+    IDs are valid but may provide fewer than three eligible neighbors. Evicted
+    records cannot be recovered by querying an old frame.
+
+    This container never takes ownership of, or trims, an external history.
+    Its window lookup costs O(radius), independent of stream duration. Use one
+    instance per serial worker; caller-owned records must stay CPU-compatible
+    when their coefficient vectors are consumed by the camera filter.
+    """
+
+    def __init__(self, capacity=9):
+        self._capacity = _integer(capacity, "capacity", minimum=1)
+        self._records = OrderedDict()
+        self._latest_frame_id = None
+
+    @property
+    def capacity(self):
+        return self._capacity
+
+    @property
+    def latest_frame_id(self):
+        return self._latest_frame_id
+
+    def __getitem__(self, frame_id):
+        return self._records[_integer(frame_id, "frame_id")]
+
+    def __setitem__(self, frame_id, record):
+        frame_id = _integer(frame_id, "frame_id")
+        if not isinstance(record, Mapping):
+            raise TypeError("camera history record must be a mapping")
+        if self._latest_frame_id is not None and frame_id < self._latest_frame_id:
+            raise ValueError("camera history frame IDs must be monotonic; reset() before a seek")
+        self._records[frame_id] = record
+        self._latest_frame_id = frame_id
+        if len(self._records) > self._capacity:
+            self._records.popitem(last=False)
+
+    def __delitem__(self, frame_id):
+        del self._records[_integer(frame_id, "frame_id")]
+
+    def __iter__(self):
+        return iter(self._records)
+
+    def __len__(self):
+        return len(self._records)
+
+    def reset(self):
+        """Release all retained records and allow a new frame-ID sequence."""
+        self._records.clear()
+        self._latest_frame_id = None
+
+    def clear(self):
+        self.reset()
+
+    def items_in_window(self, frame_id, radius=4):
+        """Yield retained records in ascending ID order, without scanning history."""
+        frame_id = _integer(frame_id, "frame_id")
+        radius = _integer(radius, "radius", minimum=0)
+        for key in range(frame_id - radius, frame_id + radius + 1):
+            record = self._records.get(key)
+            if record is not None:
+                yield key, record
 
 
 def _require_host(value, name):
@@ -141,6 +217,9 @@ def compute_camera_filter_shared(
     records with exactly one field are skipped. Neighbors satisfy
     ``abs(key - frame_id) <= neighbor_radius``: radius 4 matches the original
     ``abs(...) < 5`` (its comment saying +/-2 was inconsistent with its code).
+    ``BoundedCameraHistory`` reads that window directly. Other mappings retain
+    the original full traversal and validate every frame-ID key, even outside
+    the window. The filter never deletes records from either kind of history.
 
     Policies:
       * corrected: select the sorted row whose key equals frame_id;
@@ -184,7 +263,12 @@ def compute_camera_filter_shared(
 
     neighbors = []
     legacy_index = 0
-    for key, record in history.items():
+    history_items = (
+        history.items_in_window(frame_id, neighbor_radius)
+        if isinstance(history, BoundedCameraHistory)
+        else history.items()
+    )
+    for key, record in history_items:
         key = _integer(key, "paste_data_stack frame ID")
         if abs(key - frame_id) > neighbor_radius:
             continue
@@ -211,4 +295,4 @@ def compute_camera_filter_shared(
     return filtered, motion_rate
 
 
-__all__ = ["compute_camera_filter_shared"]
+__all__ = ["BoundedCameraHistory", "compute_camera_filter_shared"]

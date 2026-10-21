@@ -2,13 +2,14 @@
 
 ## 项目与运行
 
-- 这是 Python GPU 库和命令行基准，没有 Web 服务。当前本地版本 `2026-10-21-perf4.4-bucketed`。原包 perf4.1 基线为 `0b97beb`；最初 perf4 为 `480fad5`。本轮改动为桶素材缓存解耦和复用 batch 的 Triton 采样；最新证据与最终判断见 `BUCKETED_OPTIMIZATION_REVIEW.md`。
+- 这是 Python GPU 库和命令行基准，没有 Web 服务。当前本地版本 `2026-10-21-perf4.5-streaming`。原包 perf4.1 基线为 `0b97beb`；最初 perf4 为 `480fad5`。本轮整理直播缓存上限、重复准备和资源生命周期，未改 batch 默认或 auto 表；实现与验收状态见 `STREAMING_REVIEW.md`。
 - 默认解释器：`E:\dev\virtualAds\env\paste_gpu_performance\Scripts\python.exe`。不要直接用系统 Python，也不要修改其他项目的环境。
 - 使用 `scripts/setup.ps1` 从 `requirements-lock.txt` 安装依赖；torch 独立使用官方 cu128 源。依赖调整应同步锁文件并验证 CUDA / Triton 兼容。
 - `scripts/run.ps1 shared ...` 对应 `benchmark_shared_paste.py`；`scripts/run.ps1 batch ...` 对应 `benchmark_paste_gpu_batch.py`。
 - `scripts/run.ps1 backends ...` 对应 `benchmark_backend_comparison.py`；`before_bucketed` 候选配合 `--baseline` 在同进程隔离比较旧桶、当前桶和 batch，`--require-exact` 指定必须零差异的候选。`check-backends` 对应 `check_backend_contracts.py`；`check-policy` 对应 CPU 元数据测试 `test_backend_policy.py`。旧 batch 源码对照仍用 `compare` / `benchmark_dynamic_comparison.py`，`--slots` 为单个正整数，默认 16。
+- `scripts/run.ps1 check-streaming` 对应 `check_streaming_stability.py`，需要 `--baseline` 指向保留源码；`--frames` 是固定/动态两阶段合计测量帧数，不含预热。运行示例与内存指标边界见 `STREAMING_REVIEW.md`。
 - `shared_paste_example.py` 展示业务接入；`paste_gpu_batch_adapter.py` 负责接口、素材缓存和输出，`paste_gpu_batch.py` 负责核心路由。共享参数逻辑位于 `paste_shared_params.py` / `paste_camera_filter.py`，GPU 内核在 `paste_*_kernels.py`。
-- 优先阅读 `README.md`、`ARCHITECTURE.md` 和 `BUCKETED_OPTIMIZATION_REVIEW.md`；`BACKEND_COMPARISON_REVIEW.md`、`DYNAMIC_BATCH_REVIEW.md` 与 `READABILITY_REVIEW.md` 等保留历史记录，不能据旧文档扩大当前策略范围。日志、输出和缓存不提交 Git。
+- `paste_asset_cache.py` 负责历史素材 stack 的预算/LRU/revision；当前素材与源身份引用由 adapter 持有。优先阅读 `README.md`、`ARCHITECTURE.md` 和 `STREAMING_REVIEW.md`；`BUCKETED_OPTIMIZATION_REVIEW.md`、`BACKEND_COMPARISON_REVIEW.md` 等保留历史记录，不能据旧文档扩大当前策略范围。日志、输出和缓存不提交 Git。
 - 用 `.\scripts\lint.ps1` 检查格式与静态问题；`-Fix` 仅统一格式再检查。Ruff 0.14.1/100列/LF/Python3.9语法目标，配置在 `pyproject.toml`，工具隔离于GPU环境。保留平铺导入路径；优先按已有阶段职责放置helper，不引入只为包装参数的层层对象。
 
 ## 必须保持的行为
@@ -18,13 +19,18 @@
 - K、畸变系数、单应矩阵可能原地更新；不能仅按 frame_id 缓存几何结果。尺寸按实际素材 / 显式 resize 后的高宽处理。
 - 保留 ROI 局部坐标、`z + 1e-8`、现有采样 / alpha / 通道顺序语义。不默认引入 FP16、TF32 或低秩近似。
 - `motion_rate_to_sigma`、`create_gaussian_kernel`、`compute_camera_motion_rate` 缺少生产定义。基准回调只用于合成 fixture，不得将它们冒充生产定义或在接入代码中替代业务方法。
-- Gaussian 缓存使用精确 sigma；配置变更需更新版本或清缓存。可分离路径必须验证实际二维核，不靠函数名推定可分离。
+- Gaussian 缓存使用精确 sigma，默认最多 16 项且只保留当前 owner/回调/版本/device 上下文；配置变更需更新版本或清缓存。上下文变化应释放旧 owner 强引用。可分离路径必须验证实际二维核，不靠函数名推定可分离。
 - builder / adapter 在 worker 内初始化后复用，调用方在同一计算流上串行使用；不每帧重建或清缓存。分块路径内部使用专属复制流，事件连接计算与复制；返回及异常退出前等待复制完成，禁止覆写在途GPU源或调用方持有的CPU结果。
 - `batch_chunk_size="auto"` 只查询 `paste_execution_policy.py` 的离线实测表，未知硬件/形状/布局/B回退整批；0强制原整批，正整数手动分块。修改策略必须补对应完整NumPy对照，不能以微基准推断整个流程收益。
-- 本轮 108 个合成场景的已检查帧中，新 bucketed 与 batch 全部零差异；动态 bbox 且素材与有序分组不变时不再重新打包素材。但完整调用性能尚不足以支持自动切换，默认 `batch` 和既有分块策略表保持不变，证据见 [BUCKETED_OPTIMIZATION_REVIEW.md](BUCKETED_OPTIMIZATION_REVIEW.md)。旧桶观察保留在 [历史报告](BACKEND_COMPARISON_REVIEW.md)。任何非零画面差异都不能因性能收益而获准切换后端。
+- perf4.4 的 108 个合成场景已检查帧中，bucketed 与 batch 全部零差异；动态 bbox 且素材与有序分组不变时不重新打包素材。但该轮完整调用性能不足以支持自动切换，默认 `batch` 和既有分块策略表保持不变，证据见 [BUCKETED_OPTIMIZATION_REVIEW.md](BUCKETED_OPTIMIZATION_REVIEW.md)。任何非零画面差异都不能因性能收益而获准切换后端。
 - 既有新增 auto 档位仅在 B8/B16、4/16 广告位、已测源尺寸循环及 108×320 ROI 等条件内精确匹配，并沿用现有硬软件限制；不外推到 32 广告位。
 - 桶素材缓存 key 为素材 key 加有序桶成员，只保留当前一份。bbox/ROI 容量变化且分组不变时重建 LUT 但复用打包素材；`area_caps` 改变成员分组时必须重打包。身份/版本/B/顺序/尺寸变化、素材缓存 miss、显式失效及禁用缓存仍按接口失效；实时 grid/透明度不缓存。
 - Triton zeros/border 桶路径复用 batch 的同一 warp/alpha 内核，以 B×M 和 1×L 写出 patch，再走 palette/LUT；eager/reflection 保留原 PyTorch 采样。修改时仍须验证数值顺序及完整输出。
+- 历史素材 stack 受 `max_cached_bytes`（默认 512 MiB）、尺寸数和条目数共同约束；当前完整素材工作集另计，可大于预算。revision 精确变化必须清旧代；历史条目和当前工作集须保留 source 强引用，不能用裸 `id` 替代所有权。预算不含 source storage、桶打包、LUT、输出或分配器保留量。
+- 图像/map 计划缓存只允许有限 CPU 元数据，不保留动态像素/透明度/mask。每帧仍校验实时输入形状、成员与布局，并应用当前 Tensor；不能以相同 frame_id、shape 或对象 id 跳过值变化。输入准备阶段的局部校验与直接 core 的公开校验都须保留完整契约。
+- `_warp_paste_into_supported` 只供已经完成支持/padding 检查的内部路径使用；公开 `warp_paste_into` 仍须拒绝不支持的输入。删除重复 host 检查不能改变 launch 或 GPU 数学。
+- `BoundedCameraHistory` 必须由业务显式接入，按单调 frame ID 添加真实独立状态，seek 时 reset。只有该类型走直接窗口 lookup；普通 Mapping 保留全部 key 校验与原行为，不自动裁剪外部历史。
+- builder/adapter 的 `release_resources()` 在调用之间或退出时释放库持有资源；返回的独立 NumPy 仍由调用方拥有，不能复用覆盖其存储。业务输入、历史和下游队列也须有明确上限/释放时机。不得用逐帧 `gc.collect()`、`empty_cache()` 或全局同步掩盖资源问题，也不能把 `reserved` 直接解释为泄漏。
 
 ## 回归与性能证据
 
@@ -39,6 +45,15 @@
 .\scripts\run.ps1 shared --device cuda:0 --batch 8 --slots 16 --ad-sizes 200x200 500x500 300x600 --check-only
 .\scripts\run.ps1 batch --device cuda:0 --batch 8 --slots 16 --blur-backend triton --ad-sizes 200x200 500x500 300x600 --check-only
 ```
+
+直播缓存、局部输入准备或公共 kernel guard 改动先运行 CPU 测试，再做 GPU 完整输出与持续调用检查：
+
+```powershell
+& E:\dev\virtualAds\env\paste_gpu_performance\Scripts\python.exe -m unittest test_streaming_history test_streaming_lifecycle test_adapter_preparation test_core_guards test_backend_policy
+.\scripts\run.ps1 check-streaming --device cuda:0 --baseline results/baseline_streaming_6edf109 --frames 10000 --warmup 200 --sample-every 100 --check-every 250 --revision-every 1 --retain-outputs 3 --output results/streaming_10000.json
+```
+
+持续运行报告要区分库 retained stack、当前工作集、源输入、业务输出、CUDA allocated/reserved 以及固定页分配器保留量；记录预热后趋势、释放前后和重用后的状态。只对实际检查帧声称逐字节一致，有限帧合成测试不能证明生产直播永不泄漏。共享 GPU 的基准与长测必须串行，避免相互污染。
 
 布局 / 单帧相关改动再检查 B1；缓存改动检查 `--sigma-pattern repeated` 及三尺寸容量。完整计时将共享基准的 `--check-only` 换为 `--diagnose`，保持相同 GPU、分辨率、B、广告位、核尺寸和预热 / 迭代数。报告完整调用结果与正确性差异，不能把独立微基准相加，或与旧纯 adapter 的基线直接相减。真实生产性能还需要实际回调、视频和编码 / 发送流程验证。
 

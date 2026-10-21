@@ -51,8 +51,12 @@ B>1时为[B,H,W,3]，每张图可通过results[b]取出。显式squeeze_single=F
   依据素材身份/版本/设备/B值区分条目，不会将同尺寸的不同广告混用。
   默认max_cached_sizes=2；第三种size按LRU淘汰。如有三种size可设置为3。
   每个size最多max_entries_per_size=128个条目；每个条目是一广告位的[B,4,H,W]。
-  切回同一素材对象与版本可命中；重新读取出一个新数组对象时会建立新条目。
-* cache_info()可查看各尺寸条目数及命中次数。invalidate_assets()清空全部尺寸。
+  历史stack默认另受max_cached_bytes=512MiB限制；0不保留历史。版本变化会
+  淘汰旧版本但保留累计统计，不保存多代视频帧。同一版本切回仍在LRU中的素材可命中。
+  当前完整工作集独立持有stack和原图引用，允许超过历史预算；重复帧不会因LRU
+  容量不足而重新转换。源身份/尺寸/顺序/B等元数据仍逐帧读取；仅布局计划可缓存。
+* cache_info()报告历史/当前/桶stack字节与命中/淘汰次数，字节不含原图存储和
+  allocator保留。invalidate_assets()清空素材及布局计划；禁用缓存也释放旧素材。
   backend='bucketed'的二次打包缓存仅保留当前有序分桶素材一份；bbox变化而桶成员
   不变时继续复用，不影响上述素材尺寸缓存。
 * 几何变化直接适配当前ROI，不要求固定size，不在此处自动torch.compile。
@@ -111,8 +115,9 @@ if __package__:
         pack_bucket_transparencies,
         paste_gpu_batch as _paste_gpu_batch,
         paste_gpu_bucketed,
-        validate_inputs,
     )
+    from . import paste_execution_policy as execution_policy
+    from .paste_shared_types import MotionKernelSpec
 else:
     from paste_gpu_batch import (
         homography_roi_grid,
@@ -122,10 +127,17 @@ else:
         pack_bucket_transparencies,
         paste_gpu_batch as _paste_gpu_batch,
         paste_gpu_bucketed,
-        validate_inputs,
     )
+    import paste_execution_policy as execution_policy
+    from paste_shared_types import MotionKernelSpec
 
-ADAPTER_VERSION = "2026-10-21-perf4.4-bucketed"
+if __package__:
+    from .paste_asset_cache import SizeAssetCache as _SizeAssetCache, tensor_bytes
+else:
+    from paste_asset_cache import SizeAssetCache as _SizeAssetCache, tensor_bytes
+
+
+ADAPTER_VERSION = "2026-10-21-perf4.5-streaming"
 
 
 @dataclass(frozen=True)
@@ -170,7 +182,7 @@ class AdapterOptions:
     # Asset lifetime, output ownership, and optional geometry builders.
     cache_ads: bool = True  # 未设置版本号时按版本0处理；None禁用
     max_cached_sizes: int = 2  # 500/200可共存；第三种尺寸按LRU替换
-    max_entries_per_size: int = 128  # 每个size内分别存不同广告/设备/版本
+    max_entries_per_size: int = 128  # 每个size内分别存当前版本的不同广告/设备/B组合
     return_numpy: bool = True
     squeeze_single: bool = True  # 单组兼容原paste_gpu的HWC输出；多组保留BHWC
     area_caps: tuple[int, ...] | None = None
@@ -180,6 +192,9 @@ class AdapterOptions:
     # Offline-measured scheduling; no per-frame autotuning.
     batch_chunk_size: int | str = "auto"  # auto离线配置；0整批；正整数为手动分块上限
     blur_launch_config: tuple | None = None  # 显式覆盖separable横纵启动参数，默认由auto配置选择
+
+    # Historical stacks are bounded separately from the active frame's working set.
+    max_cached_bytes: int = 512 * 1024 * 1024  # 0不保留历史；当前完整素材集仍可复用
 
 
 def _choose_plan(shape, candidates, name):
@@ -395,52 +410,6 @@ class _FrameTiming:
         )
 
 
-class _SizeAssetCache:
-    """两级LRU：外层按(H,W)，内层按素材身份/版本/设备。纯Python控制逻辑。"""
-
-    def __init__(self, max_sizes=2, max_entries=128):
-        if (
-            type(max_sizes) is not int
-            or max_sizes < 1
-            or type(max_entries) is not int
-            or max_entries < 1
-        ):
-            raise ValueError("cache capacities must be positive Python integers")
-        self.max_sizes, self.max_entries = max_sizes, max_entries
-        self.banks = OrderedDict()
-        self.hits = 0
-        self.misses = 0
-
-    def get(self, hw, key):
-        bank = self.banks.get(hw)
-        if bank is None or key not in bank:
-            self.misses += 1
-            return None
-        self.banks.move_to_end(hw)
-        bank.move_to_end(key)
-        self.hits += 1
-        return bank[key][0]
-
-    def put(self, hw, key, value, source_refs):
-        bank = self.banks.setdefault(hw, OrderedDict())
-        self.banks.move_to_end(hw)
-        # 持有原图引用，防止原图释放后Python复用id导致误命中。
-        bank[key] = (value, source_refs)
-        bank.move_to_end(key)
-        while len(bank) > self.max_entries:
-            bank.popitem(last=False)
-        while len(self.banks) > self.max_sizes:
-            self.banks.popitem(last=False)
-
-    def info(self):
-        return {
-            "sizes": {hw: len(bank) for hw, bank in self.banks.items()},
-            "hits": self.hits,
-            "misses": self.misses,
-            "max_cached_sizes": self.max_sizes,
-        }
-
-
 class PasteBatchAdapter:
     """Reusable per-worker input adapter, asset cache, and synchronous output owner.
 
@@ -508,6 +477,7 @@ class PasteBatchAdapter:
         self._layout_key = None
         self._layout = None
         self._scalar_maps = OrderedDict()
+        self._map_plans = OrderedDict()  # Bounded CPU metadata only; never retains map values.
         self._host_events = {}  # 只复用完成事件；不复用仍由调用者持有的输出
         self._chunk_transfers = {}  # 每设备一个内部复制流和可复用的生产完成事件
         self._call_count = 0
@@ -515,19 +485,54 @@ class PasteBatchAdapter:
         self.last_execution = None
         self._profile_samples = []
 
+    def release_resources(self):
+        """Release worker-owned caches between calls, keeping returned arrays valid.
+
+        Use at a stream/session boundary or when a worker becomes idle, not in
+        the frame loop. PyTorch may retain freed storage in its allocators; this
+        method does not empty global caches or release the caller's input data.
+        The same adapter can render again and rebuild its caches lazily.
+        """
+        for copy_stream, _ in self._chunk_transfers.values():
+            copy_stream.synchronize()
+        self.invalidate_assets()
+        self._layout_key = self._layout = None
+        self._scalar_maps.clear()
+        self._map_plans.clear()
+        self._host_events.clear()
+        self._chunk_transfers.clear()
+        self._profile_samples.clear()
+        self.last_profile = self.last_execution = None
+
     def invalidate_assets(self):
         """清空所有size的素材缓存；素材原地修改后调用或增加版本号。"""
         self._asset_cache = _SizeAssetCache(
-            self.options.max_cached_sizes, self.options.max_entries_per_size
+            self.options.max_cached_sizes,
+            self.options.max_entries_per_size,
+            self.options.max_cached_bytes,
         )
         self._asset_key = None
         self._ads = None
+        self._asset_source_refs = ()
+        self._image_plans = OrderedDict()
         self._bucket_asset_key = None
         self._bucket_ads = None
 
     def cache_info(self):
-        """返回尺寸缓存条目数、命中/未命中次数；不读取GPU数值。"""
-        return dict(self._asset_cache.info(), scalar_maps=len(self._scalar_maps))
+        """Report retained stack bytes; source storage and allocator reserves are excluded."""
+        current = {id(value): value for value in self._ads or ()}
+        buckets = {id(value): value for value in self._bucket_ads or ()}
+        retained = {id(value): value for value in self._asset_cache.tensors()}
+        retained.update(current)
+        retained.update(buckets)
+        return dict(
+            self._asset_cache.info(),
+            scalar_maps=len(self._scalar_maps),
+            image_plans=len(self._image_plans),
+            current_bytes=sum(tensor_bytes(value) for value in current.values()),
+            bucket_bytes=sum(tensor_bytes(value) for value in buckets.values()),
+            retained_stack_bytes=sum(tensor_bytes(value) for value in retained.values()),
+        )
 
     def profile_summary(self, reset=False):
         """最近最多120个采样帧；CUDA事件是流上经过时间，可能包含CPU供给间隙。"""
@@ -611,10 +616,20 @@ class PasteBatchAdapter:
             if isinstance(revision, torch.Tensor):
                 raise TypeError("imgs_raw_version must be a Python int/string, not Tensor")
             hash(revision)
+        # A revision identifies current source contents, not a video-frame history.
+        # Disabled caching also releases previously retained revisions.
+        revision_changed = self._asset_cache.set_revision(revision if cache_enabled else None)
+        if revision_changed or not cache_enabled:
+            self._asset_key = None
+            self._ads = None
+            self._asset_source_refs = ()
+            self._bucket_asset_key = None
+            self._bucket_ads = None
         slot_order = tuple((param["ad_placement_id"], param["ad_id"]) for param in params)
+        device_key = str(device)
         key = (
             revision,
-            str(device),
+            device_key,
             image_index,
             opt.ad_layout,
             len(groups),
@@ -625,13 +640,27 @@ class PasteBatchAdapter:
             opt.resize_antialias,
             opt.legacy_alpha,
         )
+        if cache_enabled and key == self._asset_key and self._ads is not None:
+            # The current working set may exceed the historical byte/size limits.
+            # Its separate source refs keep every identity in key alive even when
+            # the LRU no longer owns those sources. No source pixels were cached
+            # during metadata inspection: replacement and shape changes remain live.
+            self._asset_cache.hit_current(len(self._ads))
+            return self._ads
+
+        # Release the previous working set before constructing the new one. LRU
+        # entries, where retained, still support switching B/material combinations.
+        self._asset_key = None
+        self._ads = None
+        self._asset_source_refs = ()
+        self._bucket_asset_key = None
+        self._bucket_ads = None
         ads_list = []
-        any_miss = False
         for members, member_signature in zip(sources, slot_signatures):
             hw = members[0][2]
             slot_key = (
                 revision,
-                str(device),
+                device_key,
                 image_index,
                 opt.ad_layout,
                 len(groups),
@@ -643,7 +672,6 @@ class PasteBatchAdapter:
             )
             stacked = self._asset_cache.get(hw, slot_key) if cache_enabled else None
             if stacked is None:
-                any_miss = True
                 stacked = torch.cat(
                     [
                         self._resize_ad(_apply_plan(_as_tensor(image, device), plan), target_hw)
@@ -657,15 +685,24 @@ class PasteBatchAdapter:
             ads_list.append(stacked)
 
         ads = tuple(ads_list)
-        # Keep only the current packed asset set. A source-cache miss also
-        # invalidates it, preserving the source-reference lifetime guarantees.
-        # Geometry changes are handled separately in _prepare_bucket_inputs.
-        if any_miss or not cache_enabled or key != self._asset_key:
-            self._bucket_asset_key = None
-            self._bucket_ads = None
         self._asset_key = key if cache_enabled else None
         self._ads = ads if cache_enabled else None
+        if cache_enabled:
+            self._asset_source_refs = tuple(image for members in sources for image, _, _ in members)
         return ads
+
+    def _cached_image_plan(self, shape, channels, layout, name):
+        """Reuse validated layout metadata without retaining source tensors."""
+        key = (tuple(shape), channels, layout)
+        plan = self._image_plans.get(key)
+        if plan is None:
+            plan = _image_plan(shape, channels, layout, name)
+            self._image_plans[key] = plan
+            if len(self._image_plans) > 128:
+                self._image_plans.popitem(last=False)
+        else:
+            self._image_plans.move_to_end(key)
+        return plan
 
     def _describe_ad_sources(self, groups, params, image_index):
         """Validate source metadata before touching the asset cache.
@@ -708,7 +745,7 @@ class PasteBatchAdapter:
                         f"group {group_index}, slot {slot_index}: image must be Tensor or ndarray"
                     )
                 source_name = f"group {group_index}, slot {slot_index}"
-                plan = _image_plan(image.shape, 4, opt.ad_layout, source_name)
+                plan = self._cached_image_plan(image.shape, 4, opt.ad_layout, source_name)
                 if plan[1][0] != 1:
                     raise ValueError(
                         f"{source_name}: one image per group required, got {plan[1][0]}"
@@ -800,7 +837,17 @@ class PasteBatchAdapter:
                 self._scalar_maps.move_to_end(key)
         else:
             tensor = _as_tensor(value, device)
-            plan = _map_plan(tensor.shape, batch, hw, channels, layout, name)
+            # Only the permutation/broadcast plan is reusable. Tensor and
+            # ndarray contents must still be read on every call.
+            key = (tuple(tensor.shape), batch, hw, channels, layout)
+            plan = self._map_plans.get(key)
+            if plan is None:
+                plan = _map_plan(tensor.shape, batch, hw, channels, layout, name)
+                self._map_plans[key] = plan
+                if len(self._map_plans) > 128:
+                    self._map_plans.popitem(last=False)
+            else:
+                self._map_plans.move_to_end(key)
             result = _apply_plan(tensor, plan, contiguous=not self.options.optimize_views)
             if scale != 1.0:
                 result = result / scale
@@ -939,17 +986,36 @@ class PasteBatchAdapter:
             or grid_dict is None
             or any(grid_dict.get(param["ad_id"]) is None for param in params)
         ):
-            built_grids = opt.warp_grids_builder(
-                params=params,
-                ads=ads,
-                boxes=boxes,
-                device=device,
-                batch=batch,
-                warp_align_corners=opt.warp_align_corners,
-                matrix_coordinates=opt.matrix_coordinates,
-            )
-            if not isinstance(built_grids, (tuple, list)) or len(built_grids) != len(params):
-                raise ValueError("warp_grids_builder must return one grid per ad_param")
+            try:
+                built_grids = opt.warp_grids_builder(
+                    params=params,
+                    ads=ads,
+                    boxes=boxes,
+                    device=device,
+                    batch=batch,
+                    warp_align_corners=opt.warp_align_corners,
+                    matrix_coordinates=opt.matrix_coordinates,
+                )
+                if not isinstance(built_grids, (tuple, list)) or not len(built_grids) == len(
+                    params
+                ) == len(ads) == len(boxes):
+                    raise ValueError("warp_grids_builder must return one grid per ad_param")
+                # This extension receives cached tensors. Keep the boundary
+                # guard in case a custom callback mutates their metadata.
+                for ad in ads:
+                    if (
+                        ad.ndim != 4
+                        or ad.shape[:2] != (batch, 4)
+                        or min(ad.shape[-2:]) < 1
+                        or ad.device != device
+                        or ad.dtype != torch.float32
+                    ):
+                        raise ValueError("warp_grids_builder must preserve prepared source tensors")
+            except Exception:
+                # A failed callback may have modified a cached tensor before
+                # raising. Do not reuse that working set on the next call.
+                self.invalidate_assets()
+                raise
 
         grids, opacity = [], []
         for slot_index, (param, box, ad) in enumerate(zip(params, boxes, ads)):
@@ -1043,16 +1109,12 @@ class PasteBatchAdapter:
         )
         return distortion, mask
 
-    def _prepare_motion_kernel(self, kernel_value, device, opt):
+    def _prepare_motion_kernel(self, kernel_value, device, batch, opt):
         """Unpack a dense kernel and optional verified factors without recomputing them.
 
         Shared kernels become [4, 1, kh, kw]; existing [B, 4, 1, kh, kw]
         kernels retain their batch axis. One-dimensional factors stay shared.
         """
-        if __package__:
-            from .paste_shared_types import MotionKernelSpec
-        else:
-            from paste_shared_types import MotionKernelSpec
         blur_factors = None
         if isinstance(kernel_value, MotionKernelSpec):
             if kernel_value.factors is not None:
@@ -1063,6 +1125,11 @@ class PasteBatchAdapter:
             kernel = kernel[None, None].expand(4, 1, -1, -1)
         elif kernel.ndim == 4 and kernel.shape[:2] == (1, 1):
             kernel = kernel.expand(4, 1, -1, -1)
+        valid_channels = (kernel.ndim == 4 and kernel.shape[:2] == (4, 1)) or (
+            kernel.ndim == 5 and kernel.shape[:3] == (batch, 4, 1)
+        )
+        if not valid_channels or any(size <= 0 or size % 2 == 0 for size in kernel.shape[-2:]):
+            raise ValueError("kernel must be [4,1,odd_h,odd_w] or [B,4,1,odd_h,odd_w]")
         if not opt.optimize_views:
             kernel = kernel.contiguous()
         return kernel, blur_factors
@@ -1070,11 +1137,9 @@ class PasteBatchAdapter:
     def _select_execution(self, args, boxes, blur_factors, batch, opt):
         """Resolve offline/manual settings and record the exact settings to execute."""
         if opt.batch_chunk_size == "auto":
-            if __package__:
-                from .paste_execution_policy import choose_execution
-            else:
-                from paste_execution_policy import choose_execution
-            chunk_size, blur_config, reason = choose_execution(args, boxes, opt, blur_factors)
+            chunk_size, blur_config, reason = execution_policy.choose_execution(
+                args, boxes, opt, blur_factors
+            )
         else:
             chunk_size, blur_config, reason = opt.batch_chunk_size, None, "explicit"
 
@@ -1214,10 +1279,12 @@ class PasteBatchAdapter:
                 batch,
                 opt,
             )
-            kernel, blur_factors = self._prepare_motion_kernel(kernel_value, device, opt)
+            kernel, blur_factors = self._prepare_motion_kernel(kernel_value, device, batch, opt)
             # Core argument order is part of the existing pure-tensor interface.
+            # Each prepare stage validates its own shape/broadcast contract and
+            # converts to float32 on this device. Do not scan the same tree again
+            # here; direct core callers can still use public validate_inputs().
             args = (frames, ads, tuple(grids), distortion, kernel, mask, tuple(opacity))
-            validate_inputs(args, boxes)
             chunk_size, core_options = self._select_execution(args, boxes, blur_factors, batch, opt)
             result = self._render_prepared(
                 args, boxes, core_options, chunk_size, batch, opt, timing

@@ -15,6 +15,9 @@ sigma and callback configuration. Call clear_cache(), change
 owner.gaussian_kernel_cache_version, or change builder.kernel_cache_version
 when configuration changes. Disable it with cache_kernels=False. Sigma values
 are never quantized. Camera, coefficient and homography VALUES are never cached.
+Only the current owner/callback/version/device context is retained. Switching
+that context drops its old kernels and identity references. At stream shutdown,
+release_resources() drops the current context too; caller-held outputs remain valid.
 
 Normalization 'legacy' reproduces 2*source/(size-1)-1 regardless of the sampling
 align_corners flag. 'matched' changes normalization to match that flag. ROI
@@ -339,10 +342,20 @@ class SharedParameterBuilder:
         self.clear_cache()
 
     def clear_cache(self):
-        """Forget all cached Gaussian tensors/factors and reset cache statistics."""
+        """Release Gaussian tensors and owner/callback references; reset statistics.
+
+        Does not clear caller-owned camera history or invalidate returned tensors.
+        No CUDA synchronization or allocator-wide empty_cache is performed.
+        """
         self._kernel_cache = OrderedDict()
+        self._kernel_context = None
+        self._kernel_context_refs = ()
         self._kernel_hits = self._kernel_misses = 0
         self.last_info = {}
+
+    def release_resources(self):
+        """End this builder's stream context; the builder may be reused afterward."""
+        self.clear_cache()
 
     def cache_info(self):
         return {
@@ -407,24 +420,32 @@ class SharedParameterBuilder:
             hash(version)
         sigma_identity = _callback_identity(sigma_callback)
         kernel_identity = _callback_identity(kernel_callback)
-        key = (
+        context = (
             id(owner),
             tuple(map(id, sigma_identity)),
             tuple(map(id, kernel_identity)),
-            sigma_type,
-            type(sigma),
-            sigma,
-            zero_sign,
             str(device),
             owner_version,
             self.kernel_cache_version,
             self.enable_separable,
+            self.cache_limit,
+            self.cache_kernels,
         )
+        if context != self._kernel_context:
+            # Identity references prevent recycled Python IDs from producing a
+            # hit, but must not keep several old owners and their histories alive.
+            # Preserve cumulative hit/miss counters on automatic context changes.
+            self._kernel_cache.clear()
+            self._kernel_context = context if self.cache_kernels else None
+            self._kernel_context_refs = (
+                (owner, *sigma_identity, *kernel_identity) if self.cache_kernels else ()
+            )
+        key = (sigma_type, type(sigma), sigma, zero_sign)
         cached = self._kernel_cache.get(key) if self.cache_kernels else None
         if cached is not None:
             self._kernel_cache.move_to_end(key)
             self._kernel_hits += 1
-            value, info, _ = cached
+            value, info = cached
             self.last_info.update(info, kernel_cache_hit=True)
             return value
         self._kernel_misses += 1
@@ -449,8 +470,7 @@ class SharedParameterBuilder:
             )
         value = _upload_motion_kernel(kernel_array, factor_arrays, device)
         if self.cache_kernels:
-            # Hold identity objects so Python cannot recycle their IDs into a hit.
-            self._kernel_cache[key] = (value, info, (owner, *sigma_identity, *kernel_identity))
+            self._kernel_cache[key] = (value, info)
             while len(self._kernel_cache) > self.cache_limit:
                 self._kernel_cache.popitem(last=False)
         return value

@@ -526,6 +526,35 @@ def warp_paste_into(
         raise ValueError("warp_paste_into requires inference float32 CUDA tensors and Triton")
     if padding_mode not in ("zeros", "border"):
         raise ValueError("Triton warp supports zeros/border; use PyTorch for reflection")
+    _warp_paste_into_supported(
+        source,
+        grid,
+        opacity,
+        canvas,
+        bbox,
+        align_corners=align_corners,
+        padding_mode=padding_mode,
+        legacy_alpha=legacy_alpha,
+    )
+
+
+def _warp_paste_into_supported(
+    source,
+    grid,
+    opacity,
+    canvas,
+    bbox,
+    *,
+    align_corners=False,
+    padding_mode="zeros",
+    legacy_alpha=True,
+):
+    """Launch after the public wrapper or core has checked support and padding.
+
+    Keep this internal entry separate from the guarded public API: the core
+    already resolves support per slot, and need not scan the same metadata a
+    second time. Expansion, strides, launch settings and device math are shared.
+    """
     x1, y1, x2, y2 = bbox
     roi_h, roi_w = y2 - y1, x2 - x1
     batch = source.shape[0]
