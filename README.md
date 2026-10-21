@@ -1,6 +1,6 @@
-# GPU 广告贴图库
+# VirtualAds
 
-这是 PyTorch / Triton GPU 贴图库和命令行基准程序，没有 Web 服务或浏览器界面。当前本地版本为 `2026-10-21-perf4.5-streaming`，位于 `E:\dev\virtualAds\paste_gpu_performance`。
+VirtualAds 是 PyTorch / Triton GPU 广告贴图库和命令行基准程序，没有 Web 服务或浏览器界面。当前版本为 `2026-10-21-perf4.5-streaming`。
 
 本轮整理直播长期运行的缓存上限、输入准备和资源释放。默认后端仍为 `batch`，既有 `auto` 分块策略表保持不变。
 先读 [代码阅读与修改指南](ARCHITECTURE.md)；本机 12 场景完整调用平均耗时下降 0.64%～6.72%，具体条件及持续运行验收状态见 [直播运行报告](STREAMING_REVIEW.md)。上一轮桶优化结果保留在 [桶优化报告](BUCKETED_OPTIMIZATION_REVIEW.md)，不据此自动切换到 bucketed。
@@ -9,26 +9,51 @@
 
 直播接入可显式使用 `BoundedCameraHistory(capacity=9)`，按单调帧号写入独立相机记录，并给下游输出队列设置容量。素材历史 stack 默认预算为 512 MiB，当前素材工作集与桶打包存储另计，这不是进程总内存上限。worker 退出时调用 builder 和 adapter 的 `release_resources()`；具体循环示例、10000 帧观察及仍未确定根因的编译异常见 [直播运行报告](STREAMING_REVIEW.md)。
 
-格式与静态检查：`.\scripts\lint.ps1`；自动格式化后检查：`.\scripts\lint.ps1 -Fix`。工具使用独立 uv 环境，不改 GPU 依赖。
+格式与静态检查使用 Ruff 0.14.1，运行于独立 uv 工具环境；新克隆的通用命令见下文，不改 GPU 依赖。
 
 代码来源于[原分享会话](https://chatgpt.com/share/6ad7de37-4b64-83ec-9ac2-1ad7013e17b5)及[perf4.1 分享会话](https://chatgpt.com/share/6ad82a9c-6d28-83ec-a454-ff17371706f4)。归档与原包校验见 [PERF4_1_REVIEW.md](PERF4_1_REVIEW.md)，初次部署记录见 [VALIDATION.md](VALIDATION.md)；当前代码包含后续本地优化。原包说明保留在 [SHARED_PIPELINE_README.md](SHARED_PIPELINE_README.md) 和 [paste_gpu_performance_README.txt](paste_gpu_performance_README.txt)。
 
-## 环境与启动
+## 文档导航
 
-在 PowerShell 中执行：
+| 阅读目的 | 入口 |
+|---|---|
+| 安装、运行与基线恢复 | 本页下面的步骤 |
+| 一帧执行顺序、模块职责、形状与缓存 | [ARCHITECTURE.md](ARCHITECTURE.md) |
+| 直播循环、性能、长期运行与已知限制 | [STREAMING_REVIEW.md](STREAMING_REVIEW.md) |
+| 动态素材组接入 | [dynamic_paste_example.py](dynamic_paste_example.py)、[shared_paste_example.py](shared_paste_example.py) |
+| Codex / 开发者修改约束与回归 | [AGENTS.md](AGENTS.md) |
+| 较早版本的验证记录 | [桶优化](BUCKETED_OPTIMIZATION_REVIEW.md)、[后端对比](BACKEND_COMPARISON_REVIEW.md)、[初次部署](VALIDATION.md) |
+
+报告是相应版本、机器与合成输入的测量记录，不能直接当作新机器上的性能或生产验收结论。仓库包含代码与文档；`results/`、`logs/`、环境目录和编译缓存不随 Git 分发。报告中的原始 JSON、日志及诊断快照路径是测试机器的本地记录，新克隆不含这些文件；旧版本源码可按下文从 Git 历史恢复，原测量结果则不会由此恢复。
+
+## 新克隆：环境与启动
+
+当前锁文件与 PowerShell 安装入口针对 Windows / Python 3.12，包含 `triton-windows`；它不是可直接跨平台使用的通用锁文件。先准备 Git、**已安装的 Python 3.12 和 uv**，再创建项目环境。`setup.ps1` 使用传入的可执行文件安装锁定依赖，不负责下载或安装 Python / uv。GPU 渲染还需要可用的 NVIDIA CUDA 设备与驱动；报告中的已测 GPU 为 RTX 4090。
+
+在希望存放项目的父目录打开 PowerShell，完整克隆仓库：
 
 ```powershell
-Set-Location E:\dev\virtualAds\paste_gpu_performance
-.\scripts\setup.ps1
+git clone https://github.com/adshhzy/VirtualAds.git
+Set-Location VirtualAds
+```
+
+下面通过已安装的 Windows `py` launcher 选择 Python 3.12，并从 PATH 查找 uv；如果没有 `py` launcher，可直接把现有 Python 3.12 的绝对路径传给 `-PythonPath`。
+
+```powershell
+$pythonLauncher = (Get-Command py.exe -CommandType Application -ErrorAction Stop).Source
+$python312Path = & $pythonLauncher -3.12 -c 'import sys; print(sys.executable)'
+if ($LASTEXITCODE -ne 0) { throw 'An existing Python 3.12 installation is required.' }
+$uvExecutable = (Get-Command uv.exe -CommandType Application -ErrorAction Stop).Source
+.\scripts\setup.ps1 -PythonPath $python312Path -UvPath $uvExecutable
 .\scripts\run.ps1 shared --version
 .\scripts\run.ps1 batch --version
 ```
 
-独立 Python 环境位于 `E:\dev\virtualAds\env\paste_gpu_performance`。默认基础 Python 为 `..\env\python312\python.exe`，uv 为 `..\env\tools\bin\uv.exe`，下载与编译缓存位于 `..\env\cache`。无需激活环境，也不依赖系统 `python` 的选择。
+默认项目环境在**仓库父目录**的 `env\paste_gpu_performance`，缓存在同一父目录的 `env\cache`；环境名不会随克隆目录名改变。例如仓库为 `C:\Work\VirtualAds` 时，解释器为 `C:\Work\env\paste_gpu_performance\Scripts\python.exe`。无需激活环境。多个克隆若共用同一父目录，默认也会共用这个环境；需要隔离时使用下述覆盖参数。
 
-`requirements-lock.txt` 锁定依赖，包括 PyTorch `2.9.1+cu128`、NumPy `2.5.2`、SciPy `1.18.1` 和 `triton-windows 3.5.1.post24`。安装脚本分别从 PyTorch 官方 cu128 源下载 torch、从 PyPI 下载其他依赖，并执行依赖和导入检查。正式 GPU 基准需要可用的 NVIDIA CUDA 设备；`--help` / `--version` 不需要 GPU。
+`requirements-lock.txt` 锁定依赖，包括 PyTorch `2.9.1+cu128`、NumPy `2.5.2`、SciPy `1.18.1` 和 `triton-windows 3.5.1.post24`。安装脚本分别从 PyTorch 官方 cu128 源下载 torch、从 PyPI 下载其他依赖，并执行依赖和导入检查。依赖安装完成后，`--help` / `--version` 不需要 GPU。
 
-迁移目录时可明确覆盖路径：
+也可直接指定现有工具与独立环境路径。以下路径是示例，按本机安装位置替换：
 
 ```powershell
 .\scripts\setup.ps1 -PythonPath C:\Python312\python.exe -UvPath C:\Tools\uv.exe -EnvironmentPath D:\venvs\paste_gpu -CachePath D:\cache\paste_gpu
@@ -36,7 +61,22 @@ $env:PASTE_GPU_PYTHON = 'D:\venvs\paste_gpu\Scripts\python.exe'
 .\scripts\run.ps1 shared --version
 ```
 
-路径参数中的相对路径按调用者当前目录解析。`run.ps1` 默认使用上述独立环境；可通过 `PASTE_GPU_PYTHON` 指定另一个解释器。已有的 `TRITON_CACHE_DIR` / `TORCHINDUCTOR_CACHE_DIR` 环境变量也会保留使用。
+路径参数中的相对路径按调用者当前目录解析。`run.ps1` 优先使用 `PASTE_GPU_PYTHON`，未设置时才使用仓库父目录下的默认环境；已有的 `TRITON_CACHE_DIR` / `TORCHINDUCTOR_CACHE_DIR` 也会保留使用。改变 `setup.ps1 -EnvironmentPath` 后应相应设置 `PASTE_GPU_PYTHON`。
+
+`setup.ps1 -CachePath` 指定 uv 安装缓存；编译缓存由 `run.ps1` 根据仓库父目录设置，或使用上述两个已有的环境变量。
+
+本机历史记录：测试仓库为 `E:\dev\virtualAds\paste_gpu_performance`，解释器为 `E:\dev\virtualAds\env\paste_gpu_performance\Scripts\python.exe`。不传参数的 setup 默认寻找 `..\env\python312\python.exe` 和 `..\env\tools\bin\uv.exe`，这是当时工作区的工具布局；新克隆不会自动获得这两个可执行文件。
+
+## 格式与静态检查
+
+在仓库根目录使用 PATH 中已安装的 uv：
+
+```powershell
+uv.exe tool run --from ruff==0.14.1 ruff format --check .
+uv.exe tool run --from ruff==0.14.1 ruff check .
+```
+
+需要自动格式化时，将第一条中的 `--check` 去掉，再执行第二条。未加入 PATH 的 uv 可用 `& '实际路径\uv.exe'` 调用。原工作区也可运行 `.\scripts\lint.ps1` 或 `.\scripts\lint.ps1 -Fix`，但该脚本固定寻找 `..\env\tools\bin\uv.exe`；它不读取 setup 的 `-UvPath` 或 `PASTE_GPU_PYTHON`。
 
 ## 运行分享页要求的基准
 
@@ -61,6 +101,37 @@ $env:PASTE_GPU_PYTHON = 'D:\venvs\paste_gpu\Scripts\python.exe'
 New-Item -ItemType Directory -Force results | Out-Null
 .\scripts\run.ps1 shared --device cuda:0 --batch 8 --slots 16 --ad-sizes 200x200 500x500 --diagnose *> results\shared-two-sizes.log
 ```
+
+## 从 Git 历史恢复基线源码
+
+`compare`、`check-streaming` 和 `backends --candidates before_bucketed ...` 需要独立的旧源码目录。目录被忽略，但相应源码在仓库 Git 历史中；请在仓库根目录执行以下 PowerShell。此例恢复 perf4.5 直播对照用的 `6edf109`，不改变当前 checkout，也不覆盖已有目录或 ZIP：
+
+```powershell
+$baselineCommit = '6edf109'
+$baselineFolder = 'baseline_streaming_6edf109'
+$resultsRoot = Join-Path (Get-Location).Path 'results'
+$baselinePath = Join-Path $resultsRoot $baselineFolder
+$archivePath = Join-Path $resultsRoot ($baselineFolder + '.zip')
+if ((Test-Path -LiteralPath $baselinePath) -or (Test-Path -LiteralPath $archivePath)) {
+    throw 'Baseline destination or ZIP already exists; inspect it or choose a new folder name.'
+}
+git cat-file -e ($baselineCommit + '^{commit}')
+if ($LASTEXITCODE -ne 0) { throw 'Baseline commit is missing; use a complete Git clone.' }
+New-Item -ItemType Directory -Path $resultsRoot -Force | Out-Null
+git archive --format=zip -o $archivePath $baselineCommit
+if ($LASTEXITCODE -ne 0) { throw 'git archive failed.' }
+Expand-Archive -LiteralPath $archivePath -DestinationPath $baselinePath -ErrorAction Stop
+```
+
+按所需对照替换上面两个变量，其他步骤不变：
+
+| `$baselineCommit` | `$baselineFolder` | 对照入口 |
+|---|---|---|
+| `6edf109` | `baseline_streaming_6edf109` | `check-streaming --baseline results/baseline_streaming_6edf109`；`compare --baseline results/baseline_streaming_6edf109 --baseline-label before` |
+| `9c6e930` | `baseline_bucketed_9c6e930` | `backends --baseline results/baseline_bucketed_9c6e930 --candidates before_bucketed bucketed batch_whole` |
+| `3ecc3b7` | `baseline_backend` | 较早 auto 扩张对照：`compare --baseline results/baseline_backend --baseline-label before_auto` |
+
+普通 `git clone` 会包含这些历史；GitHub 的源码 ZIP 下载不包含 Git 历史。若使用浅克隆，先检查 `git rev-parse --is-shallow-repository`，结果为 `true` 时可执行 `git fetch --unshallow origin` 后重试。不要为恢复基线删除现有 `results`；如果目标已存在，先核对内容或改用新的目录名，并把相同路径传给 `--baseline`。基准的 `--output` 也应选择未占用的新文件名，原始历史报告中的结果路径不代表待覆盖目标。
 
 ## 后端对比与回归
 
@@ -89,7 +160,7 @@ perf4.4 筛查覆盖 B=1/4/8/16、4/16/32 个广告位、1～3 种素材尺寸�
 .\scripts\run.ps1 backends --baseline results/baseline_bucketed_9c6e930 --candidates before_bucketed bucketed batch_whole --require-exact bucketed --batches 8 --slots 16 --profiles three --layouts static translate resize --rounds 3 --check-timed-steps
 ```
 
-`--baseline` 指向保留源码目录，`before_bucketed` 使用其中独立加载的运行时；该目录不随 Git 提交。
+`--baseline` 指向按上节恢复的源码目录，`before_bucketed` 使用其中独立加载的运行时；恢复只需 Git 历史，不需要原测试机器的 `results/`。
 `backends` 默认检查第 0、1、7 帧；确认策略时使用 `--check-timed-steps` 覆盖实际计时帧，零差异门槛只对报告中的 `checked_steps` 成立。
 `--require-exact` 指定的候选出现任何非零像素差即失败；旧桶可保留差异记录。冷素材单次耗时、独立诊断与确认测量的使用方式见 [ARCHITECTURE.md](ARCHITECTURE.md) 和 [桶优化报告](BUCKETED_OPTIMIZATION_REVIEW.md)。
 

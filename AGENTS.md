@@ -2,15 +2,16 @@
 
 ## 项目与运行
 
-- 这是 Python GPU 库和命令行基准，没有 Web 服务。当前本地版本 `2026-10-21-perf4.5-streaming`。原包 perf4.1 基线为 `0b97beb`；最初 perf4 为 `480fad5`。本轮整理直播缓存上限、重复准备和资源生命周期，未改 batch 默认或 auto 表；实现与验收状态见 `STREAMING_REVIEW.md`。
-- 默认解释器：`E:\dev\virtualAds\env\paste_gpu_performance\Scripts\python.exe`。不要直接用系统 Python，也不要修改其他项目的环境。
-- 使用 `scripts/setup.ps1` 从 `requirements-lock.txt` 安装依赖；torch 独立使用官方 cu128 源。依赖调整应同步锁文件并验证 CUDA / Triton 兼容。
+- VirtualAds 是 Python GPU 库和命令行基准，没有 Web 服务。当前版本 `2026-10-21-perf4.5-streaming`。原包 perf4.1 基线为 `0b97beb`；最初 perf4 为 `480fad5`。本轮整理直播缓存上限、重复准备和资源生命周期，未改 batch 默认或 auto 表；实现与验收状态见 `STREAMING_REVIEW.md`。
+- 先尊重调用方的 `PASTE_GPU_PYTHON`；未设置时使用 `scripts/run.ps1` 的默认解释器，即仓库父目录下 `env\paste_gpu_performance\Scripts\python.exe`。不要在新机器上硬编码旧 E 盘路径；不要直接用系统 Python 运行项目，也不要改动其他项目环境。若环境不存在，按 README 创建。
+- 当前 Windows 锁文件要求现有 Python 3.12 与 uv。`scripts/setup.ps1 -PythonPath ... -UvPath ...` 创建项目环境并安装 `requirements-lock.txt`，不会下载/安装 Python 或 uv；torch 独立使用官方 cu128 源。自定义 `-EnvironmentPath` 后相应设置 `PASTE_GPU_PYTHON`。依赖调整应同步锁文件并验证 CUDA / Triton 兼容。
+- 本机已测参考：Windows、RTX 4090、Python 3.12.14、PyTorch 2.9.1+cu128；当时解释器为 `E:\dev\virtualAds\env\paste_gpu_performance\Scripts\python.exe`。此路径是历史记录，不是所有克隆的固定入口。
 - `scripts/run.ps1 shared ...` 对应 `benchmark_shared_paste.py`；`scripts/run.ps1 batch ...` 对应 `benchmark_paste_gpu_batch.py`。
 - `scripts/run.ps1 backends ...` 对应 `benchmark_backend_comparison.py`；`before_bucketed` 候选配合 `--baseline` 在同进程隔离比较旧桶、当前桶和 batch，`--require-exact` 指定必须零差异的候选。`check-backends` 对应 `check_backend_contracts.py`；`check-policy` 对应 CPU 元数据测试 `test_backend_policy.py`。旧 batch 源码对照仍用 `compare` / `benchmark_dynamic_comparison.py`，`--slots` 为单个正整数，默认 16。
-- `scripts/run.ps1 check-streaming` 对应 `check_streaming_stability.py`，需要 `--baseline` 指向保留源码；`--frames` 是固定/动态两阶段合计测量帧数，不含预热。运行示例与内存指标边界见 `STREAMING_REVIEW.md`。
+- `scripts/run.ps1 check-streaming` 对应 `check_streaming_stability.py`，需要 `--baseline` 指向保留源码；`--frames` 是固定/动态两阶段合计测量帧数，不含预热。新克隆先按 README 的 `git archive`/`Expand-Archive` 步骤恢复 `6edf109`；旧桶基线为 `9c6e930`。禁止为恢复基线覆盖或删除已有 results。运行示例与内存指标边界见 `STREAMING_REVIEW.md`。
 - `shared_paste_example.py` 展示业务接入；`paste_gpu_batch_adapter.py` 负责接口、素材缓存和输出，`paste_gpu_batch.py` 负责核心路由。共享参数逻辑位于 `paste_shared_params.py` / `paste_camera_filter.py`，GPU 内核在 `paste_*_kernels.py`。
-- `paste_asset_cache.py` 负责历史素材 stack 的预算/LRU/revision；当前素材与源身份引用由 adapter 持有。优先阅读 `README.md`、`ARCHITECTURE.md` 和 `STREAMING_REVIEW.md`；`BUCKETED_OPTIMIZATION_REVIEW.md`、`BACKEND_COMPARISON_REVIEW.md` 等保留历史记录，不能据旧文档扩大当前策略范围。日志、输出和缓存不提交 Git。
-- 用 `.\scripts\lint.ps1` 检查格式与静态问题；`-Fix` 仅统一格式再检查。Ruff 0.14.1/100列/LF/Python3.9语法目标，配置在 `pyproject.toml`，工具隔离于GPU环境。保留平铺导入路径；优先按已有阶段职责放置helper，不引入只为包装参数的层层对象。
+- `paste_asset_cache.py` 负责历史素材 stack 的预算/LRU/revision；当前素材与源身份引用由 adapter 持有。优先阅读 `README.md`、`ARCHITECTURE.md` 和 `STREAMING_REVIEW.md`；`BUCKETED_OPTIMIZATION_REVIEW.md`、`BACKEND_COMPARISON_REVIEW.md` 等为历史记录，不能据旧文档扩大当前策略范围。results/logs/env/缓存不随 Git 分发；报告中的原始测试 artifact 不在新克隆内，恢复源码不能恢复旧测量数据。
+- 新克隆用已有 uv 执行 `uv.exe tool run --from ruff==0.14.1 ruff format --check .` 和 `uv.exe tool run --from ruff==0.14.1 ruff check .`。`scripts/lint.ps1` 仅适用于已有 `..\env\tools\bin\uv.exe` 的工作区，不读取 setup 的 `-UvPath`；`-Fix` 仅统一格式再检查。Ruff 0.14.1/100列/LF/Python3.9语法目标，配置在 `pyproject.toml`，工具隔离于GPU环境。保留平铺导入路径；优先按阶段职责放置 helper，不引入只为包装参数的层层对象。
 
 ## 必须保持的行为
 
@@ -49,9 +50,14 @@
 直播缓存、局部输入准备或公共 kernel guard 改动先运行 CPU 测试，再做 GPU 完整输出与持续调用检查：
 
 ```powershell
-& E:\dev\virtualAds\env\paste_gpu_performance\Scripts\python.exe -m unittest test_streaming_history test_streaming_lifecycle test_adapter_preparation test_core_guards test_backend_policy
+$workspaceRoot = Split-Path -Parent (Get-Location).Path
+$pythonCandidate = if ($env:PASTE_GPU_PYTHON) { $env:PASTE_GPU_PYTHON } else { Join-Path $workspaceRoot 'env\paste_gpu_performance\Scripts\python.exe' }
+$projectPython = (Resolve-Path -LiteralPath $pythonCandidate -ErrorAction Stop).Path
+& $projectPython -m unittest test_streaming_history test_streaming_lifecycle test_adapter_preparation test_core_guards test_backend_policy
 .\scripts\run.ps1 check-streaming --device cuda:0 --baseline results/baseline_streaming_6edf109 --frames 10000 --warmup 200 --sample-every 100 --check-every 250 --revision-every 1 --retain-outputs 3 --output results/streaming_10000.json
 ```
+
+上述命令在仓库根目录执行；基线须先恢复，`--output` 应改为未占用的新结果文件名。不能把 README 的示例路径或旧报告中的本机路径当作当前环境事实。
 
 持续运行报告要区分库 retained stack、当前工作集、源输入、业务输出、CUDA allocated/reserved 以及固定页分配器保留量；记录预热后趋势、释放前后和重用后的状态。只对实际检查帧声称逐字节一致，有限帧合成测试不能证明生产直播永不泄漏。共享 GPU 的基准与长测必须串行，避免相互污染。
 
