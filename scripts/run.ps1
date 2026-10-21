@@ -1,5 +1,5 @@
 # Deliberately not an advanced script: unknown CLI flags remain in $args.
-param([ValidateSet('shared', 'batch')][string]$Benchmark = 'shared')
+param([ValidateSet('shared', 'batch', 'dynamic', 'compare', 'tune', 'check')][string]$Benchmark = 'shared')
 
 $ErrorActionPreference = 'Stop'
 $projectPath = Split-Path -Parent $PSScriptRoot
@@ -10,7 +10,14 @@ if (-not (Test-Path -LiteralPath $pythonCandidate -PathType Leaf)) {
     throw "Python was not found at $pythonCandidate. Run scripts/setup.ps1 or set PASTE_GPU_PYTHON."
 }
 $pythonPath = (Resolve-Path -LiteralPath $pythonCandidate).Path
-$benchmarkFile = if ($Benchmark -eq 'shared') { 'benchmark_shared_paste.py' } else { 'benchmark_paste_gpu_batch.py' }
+$benchmarkFile = switch ($Benchmark) {
+    'shared' { 'benchmark_shared_paste.py' }
+    'batch' { 'benchmark_paste_gpu_batch.py' }
+    'dynamic' { 'benchmark_dynamic_batch.py' }
+    'compare' { 'benchmark_dynamic_comparison.py' }
+    'tune' { 'benchmark_blur_tuning.py' }
+    'check' { 'test_dynamic_batch.py' }
+}
 $benchmarkPath = Join-Path $projectPath $benchmarkFile
 $previousTritonCache = $env:TRITON_CACHE_DIR
 $previousTorchCache = $env:TORCHINDUCTOR_CACHE_DIR

@@ -38,7 +38,7 @@ import sys
 import time
 from types import SimpleNamespace
 
-BENCHMARK_VERSION = "2026-10-21-perf4.1"
+BENCHMARK_VERSION = "2026-10-21-perf4.2-dynamic"
 GRID_ATOL = 2e-6
 
 

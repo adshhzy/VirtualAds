@@ -1,8 +1,8 @@
-# GPU 广告贴图 perf4.1
+# GPU 广告贴图 perf4.2：动态路数
 
-这是 PyTorch / Triton GPU 贴图库和命令行基准程序，没有 Web 服务或浏览器界面。当前版本为 `2026-10-21-perf4.1`，已部署到 `E:\dev\virtualAds\paste_gpu_performance`，后续可直接在 Codex 中打开此目录迭代。
+这是 PyTorch / Triton GPU 贴图库和命令行基准程序，没有 Web 服务或浏览器界面。当前本地版本为 `2026-10-21-perf4.2-dynamic`，位于 `E:\dev\virtualAds\paste_gpu_performance`。本轮新增动态路数执行策略、计算与NumPy回传重叠、可独立配置的横纵模糊核，以及严格数值回归。结果、启用范围和复现命令见 [DYNAMIC_BATCH_REVIEW.md](DYNAMIC_BATCH_REVIEW.md)。
 
-当前代码来自[最新分享会话](https://chatgpt.com/share/6ad82a9c-6d28-83ec-a454-ff17371706f4)的 `paste_gpu_performance_perf4_1.zip`，SHA256 为 `c1fbb5865f284d13b57cff251c6e11130add09b7af8f76e60fc3feae1c28a43a`，13 个原包文件已逐字节校验。perf4.1 增加 Python 3.9 延迟注解修复与运行环境日志，GPU 算法、缓存和输出协议不变。更新记录及后续方向见 [PERF4_1_REVIEW.md](PERF4_1_REVIEW.md)。
+原包基线来自[最新分享会话](https://chatgpt.com/share/6ad82a9c-6d28-83ec-a454-ff17371706f4)的 `paste_gpu_performance_perf4_1.zip`，SHA256 为 `c1fbb5865f284d13b57cff251c6e11130add09b7af8f76e60fc3feae1c28a43a`。同步时13个原包文件逐字节校验，保存于Git提交 `0b97beb`；当前文件包含之后的本地优化，不再宣称与压缩包逐字节一致。历史记录见 [PERF4_1_REVIEW.md](PERF4_1_REVIEW.md)。
 
 最初 perf4 来自[原分享会话](https://chatgpt.com/share/6ad7de37-4b64-83ec-9ac2-1ad7013e17b5)，归档 SHA256 为 `17c6354f8c478a74daa52cc6f0294a21fb71fc1eb22b2e811b8e6d1130b6a26b`；Git 原始代码基线为 `480fad5`。原包的说明保留在 [SHARED_PIPELINE_README.md](SHARED_PIPELINE_README.md) 和 [paste_gpu_performance_README.txt](paste_gpu_performance_README.txt)。
 
@@ -60,6 +60,8 @@ New-Item -ItemType Directory -Force results | Out-Null
 生产接入入口是 `shared_paste_example.py`，调用 `setup_shared_paste` 初始化 worker，再每帧调用 `prepare_shared_paste_args` 与 adapter。需要接入现有业务对象和真实数据，不能把基准 fixture 当成生产应用。
 
 原始会话未提供 `motion_rate_to_sigma`、`create_gaussian_kernel`、`compute_camera_motion_rate` 的生产实现；基准中的实现是合成回调。接入时沿用业务原方法，再用真实视频、参数和负载验收。
+
+`AdapterOptions.batch_chunk_size` 默认 `"auto"`：仅匹配已测硬件和输入结构时应用离线策略，未知情况回退整批。`0` 强制原整批，正整数强制指定分块上限。`last_execution` 可查看实际选择和回退原因。NumPy保持独立存储，返回即可读取；内部复制流不改变调用方串行调用约定。自动策略不强行启用可分离模糊，仍需真实核验证。
 
 默认 `normalization="legacy"`、`camera_index_policy="legacy"` 保留原行为；`matched` / `corrected` 是需要单独验收的语义修正。保持 B1 输出 `[H,W,3]`、多组输出 `[B,H,W,3]` 的 NumPy `uint8` 协议；K、畸变系数和单应矩阵须实时读取。GPU worker 初始化及预热后复用 builder / adapter，素材变更按既有接口使缓存失效。
 

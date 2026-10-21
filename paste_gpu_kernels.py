@@ -205,6 +205,23 @@ if triton is not None:
 
 
     @triton.jit
+    def _load_spatial_plane(Base, x, y, H: tl.constexpr, W: tl.constexpr,
+                            S_Y: tl.constexpr, S_X: tl.constexpr):
+        # Load only the stored spatial dimensions, then let the arithmetic
+        # broadcast the VALUES. Broadcasting zero-stride pointers to a 2-D
+        # tile before a masked load can fail Triton's coalescing pass.
+        if S_Y == 0 and S_X == 0:
+            value = tl.load(Base)
+        elif S_Y == 0:
+            value = tl.load(Base + x*S_X, x < W, 0.0)
+        elif S_X == 0:
+            value = tl.load(Base + y*S_Y, y < H, 0.0)
+        else:
+            value = tl.load(Base + y*S_Y + x*S_X, (x < W) & (y < H), 0.0)
+        return value
+
+
+    @triton.jit
     def _blur_blend_u8(
         Canvas, Frames, Kernel, Mask, Out,
         H: tl.constexpr, W: tl.constexpr,
@@ -254,14 +271,14 @@ if triton is not None:
                 acc_b = tl.fma(vb, wb, acc_b)
                 acc_a = tl.fma(va, wa, acc_a)
 
-        frame_offset = batch*F_B + y*F_Y + x*F_X
-        mask_offset = batch*M_B + y*M_Y + x*M_X
-        bg_r = tl.load(Frames + frame_offset, active, 0.0)
-        bg_g = tl.load(Frames + frame_offset + F_C, active, 0.0)
-        bg_b = tl.load(Frames + frame_offset + 2*F_C, active, 0.0)
-        mask_r = tl.load(Mask + mask_offset, active, 0.0)
-        mask_g = tl.load(Mask + mask_offset + M_C, active, 0.0)
-        mask_b = tl.load(Mask + mask_offset + 2*M_C, active, 0.0)
+        frame_base = Frames + batch*F_B
+        mask_base = Mask + batch*M_B
+        bg_r = _load_spatial_plane(frame_base, x, y, H, W, F_Y, F_X)
+        bg_g = _load_spatial_plane(frame_base + F_C, x, y, H, W, F_Y, F_X)
+        bg_b = _load_spatial_plane(frame_base + 2*F_C, x, y, H, W, F_Y, F_X)
+        mask_r = _load_spatial_plane(mask_base, x, y, H, W, M_Y, M_X)
+        mask_g = _load_spatial_plane(mask_base + M_C, x, y, H, W, M_Y, M_X)
+        mask_b = _load_spatial_plane(mask_base + 2*M_C, x, y, H, W, M_Y, M_X)
         if LEGACY:
             acc_r = acc_r*acc_a
             acc_g = acc_g*acc_a

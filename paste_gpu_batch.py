@@ -109,6 +109,7 @@ def paste_gpu_batch(
     acceleration: str = "eager",
     blur_backend: str = "torch",
     blur_factors: tuple[torch.Tensor, torch.Tensor] | None = None,
+    blur_launch_config=None,
 ) -> torch.Tensor:
     """无 batch 循环的计算核心；外层使用 torch.inference_mode()。
 
@@ -183,12 +184,14 @@ def paste_gpu_batch(
         canvas, frames, distortion_grid, motion_kernel, mask_canvas,
         distortion_align_corners, distortion_padding_mode, legacy_alpha,
         acceleration=acceleration, blur_backend=blur_backend, blur_factors=blur_factors,
+        blur_launch_config=blur_launch_config,
     )
 
 
 def _finish_canvas(canvas, frames, distortion_grid, motion_kernel, mask_canvas,
                    distortion_align_corners, distortion_padding_mode, legacy_alpha,
-                   *, acceleration="eager", blur_backend="torch", blur_factors=None):
+                   *, acceleration="eager", blur_backend="torch", blur_factors=None,
+                   blur_launch_config=None):
     if blur_backend not in ("torch", "triton", "separable"):
         raise ValueError("blur_backend must be 'torch', 'triton' or 'separable'")
     if blur_backend == "separable":
@@ -213,6 +216,7 @@ def _finish_canvas(canvas, frames, distortion_grid, motion_kernel, mask_canvas,
         if accelerator is not None:
             return _optional_gaussian_kernels().separable_blur_blend_to_uint8(
                 canvas, background, ky, kx, mask_canvas, legacy_alpha=legacy_alpha,
+                launch_config=blur_launch_config,
             )
         # Explicit eager/CPU reference: same zero-padded separable cross-correlation.
         canvas = F.conv2d(canvas, kx.view(1, 1, 1, -1).expand(4, 1, 1, -1),
@@ -402,7 +406,7 @@ def paste_gpu_bucketed(
     motion_kernel, mask_canvas, transparencies_buckets, canvas_lut,
     *, warp_align_corners=False, distortion_align_corners=False,
     warp_padding_mode="zeros", distortion_padding_mode="zeros", legacy_alpha=True,
-    acceleration="eager", blur_backend="torch", blur_factors=None,
+    acceleration="eager", blur_backend="torch", blur_factors=None, blur_launch_config=None,
 ):
     """仅有分桶循环的纯Tensor核心：K次透视采样+一次索引取值合成画布。
 
@@ -458,6 +462,7 @@ def paste_gpu_bucketed(
         canvas, frames, distortion_grid, motion_kernel, mask_canvas,
         distortion_align_corners, distortion_padding_mode, legacy_alpha,
         acceleration=acceleration, blur_backend=blur_backend, blur_factors=blur_factors,
+        blur_launch_config=blur_launch_config,
     )
 
 

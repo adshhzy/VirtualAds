@@ -1,5 +1,7 @@
 # perf4.1：共享参数构造与批量贴图整体优化
 
+本文保留 perf4.1 历史说明。当前动态路数实现、版本和实测结果见 [DYNAMIC_BATCH_REVIEW.md](DYNAMIC_BATCH_REVIEW.md)。
+
 2026-10-21 兼容性修复：`paste_gpu_batch.py` 补充 `from __future__ import annotations`，避免 Python 3.9 在导入时求值 `tuple[...] | None` 报错。两个 benchmark 新增 Python 版本和解释器路径输出。未修改 GPU 算法、缓存策略或输出格式；不需要为此升级 Python/CUDA。版本标记统一为 `2026-10-21-perf4.1`。
 
 本版把每帧的相机滤波、畸变网格、广告位透视网格、模糊核准备和最终 NumPy 输出一起纳入对照。旧对照同样每帧只构造一次共享参数，没有人为按 batch 重复计算。

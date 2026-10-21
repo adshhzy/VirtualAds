@@ -2,12 +2,12 @@
 
 ## 项目与运行
 
-- 这是 Python GPU 库和命令行基准，没有 Web 服务。当前原包版本 `2026-10-21-perf4.1`；最初 perf4 提交 `480fad5` 便于比较修改。perf4.1 仅修复延迟注解、更新版本与环境日志，未改变 GPU 算法。
+- 这是 Python GPU 库和命令行基准，没有 Web 服务。当前本地版本 `2026-10-21-perf4.2-dynamic`。原包 perf4.1 基线为 `0b97beb`；最初 perf4 为 `480fad5`。动态路数变更与实测见 `DYNAMIC_BATCH_REVIEW.md`。
 - 默认解释器：`E:\dev\virtualAds\env\paste_gpu_performance\Scripts\python.exe`。不要直接用系统 Python，也不要修改其他项目的环境。
 - 使用 `scripts/setup.ps1` 从 `requirements-lock.txt` 安装依赖；torch 独立使用官方 cu128 源。依赖调整应同步锁文件并验证 CUDA / Triton 兼容。
 - `scripts/run.ps1 shared ...` 对应 `benchmark_shared_paste.py`；`scripts/run.ps1 batch ...` 对应 `benchmark_paste_gpu_batch.py`。
 - `shared_paste_example.py` 展示业务接入；`paste_gpu_batch_adapter.py` 负责接口、素材缓存和输出，`paste_gpu_batch.py` 负责核心路由。共享参数逻辑位于 `paste_shared_params.py` / `paste_camera_filter.py`，GPU 内核在 `paste_*_kernels.py`。
-- 优先阅读 `README.md`、`PERF4_1_REVIEW.md`、`SHARED_PIPELINE_README.md` 和 `paste_gpu_performance_README.txt`。日志、输出和缓存不提交 Git。
+- 优先阅读 `README.md` 和 `DYNAMIC_BATCH_REVIEW.md`；`PERF4_1_REVIEW.md`、`SHARED_PIPELINE_README.md` 和 `paste_gpu_performance_README.txt` 保留历史说明。日志、输出和缓存不提交 Git。
 
 ## 必须保持的行为
 
@@ -17,13 +17,15 @@
 - 保留 ROI 局部坐标、`z + 1e-8`、现有采样 / alpha / 通道顺序语义。不默认引入 FP16、TF32 或低秩近似。
 - `motion_rate_to_sigma`、`create_gaussian_kernel`、`compute_camera_motion_rate` 缺少生产定义。基准回调只用于合成 fixture，不得将它们冒充生产定义或在接入代码中替代业务方法。
 - Gaussian 缓存使用精确 sigma；配置变更需更新版本或清缓存。可分离路径必须验证实际二维核，不靠函数名推定可分离。
-- builder / adapter 在 worker 内初始化后复用，在单一 CUDA 流上串行使用；不每帧重建或清缓存。
+- builder / adapter 在 worker 内初始化后复用，调用方在同一计算流上串行使用；不每帧重建或清缓存。分块路径内部使用专属复制流，事件连接计算与复制；返回及异常退出前等待复制完成，禁止覆写在途GPU源或调用方持有的CPU结果。
+- `batch_chunk_size="auto"` 只查询 `paste_execution_policy.py` 的离线实测表，未知硬件/形状/布局/B回退整批；0强制原整批，正整数手动分块。修改策略必须补对应完整NumPy对照，不能以微基准推断整个流程收益。
 
 ## 回归与性能证据
 
 从项目根目录运行与改动有关的检查。两种素材数的共享流程检查：
 
 ```powershell
+.\scripts\run.ps1 check --device cuda:0 --profile-checks
 .\scripts\run.ps1 shared --device cuda:0 --batch 8 --slots 16 --ad-sizes 200x200 500x500 --check-only
 .\scripts\run.ps1 shared --device cuda:0 --batch 8 --slots 16 --ad-sizes 200x200 500x500 300x600 --check-only
 .\scripts\run.ps1 batch --device cuda:0 --batch 8 --slots 16 --blur-backend triton --ad-sizes 200x200 500x500 300x600 --check-only

@@ -14,6 +14,8 @@ floating summation orders, so target-GPU numerical and latency checks are
 required before enabling this optional path.
 """
 
+from numbers import Integral
+
 import torch
 
 try:
@@ -57,6 +59,26 @@ def separable_blur_blend_supported(canvas, frames, ky, kx, mask):
                for value in (ky, kx))
 
 
+_DEFAULT_LAUNCH_CONFIG = (128, 4, 4, 128, 4, 4)
+
+
+def _resolve_launch_config(launch_config):
+    """Validate explicit offline tuning settings without inspecting CUDA state."""
+    if launch_config is None:
+        return _DEFAULT_LAUNCH_CONFIG
+    if (not isinstance(launch_config, (tuple, list)) or len(launch_config) != 6
+            or any(isinstance(value, bool) or not isinstance(value, Integral)
+                   for value in launch_config)):
+        raise ValueError("launch_config must contain six integers: (h_block_x, h_block_y, h_warps, v_block_x, v_block_y, v_warps)")
+    config = tuple(int(value) for value in launch_config)
+    for name, (block_x, block_y, warps) in zip(("horizontal", "vertical"), (config[:3], config[3:])):
+        if (block_x not in (32, 64, 128, 256, 512)
+                or block_y not in (1, 2, 4, 8, 16, 32)
+                or warps not in (1, 2, 4, 8) or block_x * block_y > 4096):
+            raise ValueError(f"{name} launch requires block_x in (32,64,128,256,512), block_y in (1,2,4,8,16,32), warps in (1,2,4,8), and block_x*block_y <=4096")
+    return config
+
+
 if triton is not None:
     @triton.jit
     def _horizontal_rgba(
@@ -91,6 +113,23 @@ if triton is not None:
 
 
     @triton.jit
+    def _load_spatial_plane(Base, x, y, H: tl.constexpr, W: tl.constexpr,
+                            S_Y: tl.constexpr, S_X: tl.constexpr):
+        # Load only the stored spatial dimensions, then let the arithmetic
+        # broadcast the VALUES. Broadcasting zero-stride pointers to a 2-D
+        # tile before a masked load can fail Triton's coalescing pass.
+        if S_Y == 0 and S_X == 0:
+            value = tl.load(Base)
+        elif S_Y == 0:
+            value = tl.load(Base + x*S_X, x < W, 0.0)
+        elif S_X == 0:
+            value = tl.load(Base + y*S_Y, y < H, 0.0)
+        else:
+            value = tl.load(Base + y*S_Y + x*S_X, (x < W) & (y < H), 0.0)
+        return value
+
+
+    @triton.jit
     def _vertical_blend_u8(
         Temp, Frames, Ky, Mask, Out,
         H: tl.constexpr, W: tl.constexpr,
@@ -116,14 +155,14 @@ if triton is not None:
             green = tl.fma(tl.load(Temp + source_offset + H*W, valid, 0.0), weight, green)
             blue = tl.fma(tl.load(Temp + source_offset + 2*H*W, valid, 0.0), weight, blue)
             alpha = tl.fma(tl.load(Temp + source_offset + 3*H*W, valid, 0.0), weight, alpha)
-        frame_offset = batch*F_B + y*F_Y + x*F_X
-        mask_offset = batch*M_B + y*M_Y + x*M_X
-        bg_r = tl.load(Frames + frame_offset, active, 0.0)
-        bg_g = tl.load(Frames + frame_offset + F_C, active, 0.0)
-        bg_b = tl.load(Frames + frame_offset + 2*F_C, active, 0.0)
-        mask_r = tl.load(Mask + mask_offset, active, 0.0)
-        mask_g = tl.load(Mask + mask_offset + M_C, active, 0.0)
-        mask_b = tl.load(Mask + mask_offset + 2*M_C, active, 0.0)
+        frame_base = Frames + batch*F_B
+        mask_base = Mask + batch*M_B
+        bg_r = _load_spatial_plane(frame_base, x, y, H, W, F_Y, F_X)
+        bg_g = _load_spatial_plane(frame_base + F_C, x, y, H, W, F_Y, F_X)
+        bg_b = _load_spatial_plane(frame_base + 2*F_C, x, y, H, W, F_Y, F_X)
+        mask_r = _load_spatial_plane(mask_base, x, y, H, W, M_Y, M_X)
+        mask_g = _load_spatial_plane(mask_base + M_C, x, y, H, W, M_Y, M_X)
+        mask_b = _load_spatial_plane(mask_base + 2*M_C, x, y, H, W, M_Y, M_X)
         if LEGACY:
             red, green, blue = red*alpha, green*alpha, blue*alpha
         red = red + bg_r*(1.0 - alpha)
@@ -144,14 +183,23 @@ if triton is not None:
         tl.store(Out + output_offset + 2, blue, active)
 
 
-def separable_blur_blend_to_uint8(canvas, frames, ky, kx, mask, *, legacy_alpha=True):
+def separable_blur_blend_to_uint8(canvas, frames, ky, kx, mask, *, legacy_alpha=True,
+                                launch_config=None):
     """Two-pass shared depthwise blur, then uint8 BHWC output.
 
     Factors are one-dimensional float32 CUDA tensors of odd lengths <=63.
     Their values are read on every invocation. Padding is zero, stride and
     dilation are one, and weights are not flipped (torch.conv2d convention).
     No input is modified; the output owns independent device storage.
+
+    launch_config optionally supplies (h_block_x, h_block_y, h_warps,
+    v_block_x, v_block_y, v_warps) for offline tuning. None preserves the
+    original 128x4 tile and four warps for each pass. Each block_x must be
+    32/64/128/256/512, block_y 1/2/4/8/16/32, and warps 1/2/4/8, with at most
+    4096 pixels per tile. Configurations still need target-GPU validation;
+    this function neither benchmarks nor selects a configuration at runtime.
     """
+    h_block_x, h_block_y, h_warps, v_block_x, v_block_y, v_warps = _resolve_launch_config(launch_config)
     if not separable_blur_blend_supported(canvas, frames, ky, kx, mask):
         raise ValueError("separable blur requires float32 CUDA inference tensors, broadcastable frames/mask, and 1D odd factors <=63 shared by all channels/batches")
     batch, _, height, width = canvas.shape
@@ -159,20 +207,20 @@ def separable_blur_blend_to_uint8(canvas, frames, ky, kx, mask, *, legacy_alpha=
     mask = mask.expand(batch, 3, height, width)
     temp = torch.empty((batch, 4, height, width), device=canvas.device, dtype=torch.float32)
     output = torch.empty((batch, height, width, 3), device=canvas.device, dtype=torch.uint8)
-    block_x, block_y = 128, 4
-    grid = (triton.cdiv(width, block_x), triton.cdiv(height, block_y), batch)
+    horizontal_grid = (triton.cdiv(width, h_block_x), triton.cdiv(height, h_block_y), batch)
+    vertical_grid = (triton.cdiv(width, v_block_x), triton.cdiv(height, v_block_y), batch)
     with torch.cuda.device(canvas.device):
-        _horizontal_rgba[grid](
+        _horizontal_rgba[horizontal_grid](
             canvas, kx, temp, H=height, W=width,
             C_B=canvas.stride(0), C_C=canvas.stride(1), C_Y=canvas.stride(2), C_X=canvas.stride(3),
-            K_S=kx.stride(0), KW=kx.numel(), BLOCK_X=block_x, BLOCK_Y=block_y,
-            num_warps=4, enable_fp_fusion=False,
+            K_S=kx.stride(0), KW=kx.numel(), BLOCK_X=h_block_x, BLOCK_Y=h_block_y,
+            num_warps=h_warps, enable_fp_fusion=False,
         )
-        _vertical_blend_u8[grid](
+        _vertical_blend_u8[vertical_grid](
             temp, frames, ky, mask, output, H=height, W=width,
             F_B=frames.stride(0), F_C=frames.stride(1), F_Y=frames.stride(2), F_X=frames.stride(3),
             M_B=mask.stride(0), M_C=mask.stride(1), M_Y=mask.stride(2), M_X=mask.stride(3),
             K_S=ky.stride(0), KH=ky.numel(), LEGACY=legacy_alpha,
-            BLOCK_X=block_x, BLOCK_Y=block_y, num_warps=4, enable_fp_fusion=False,
+            BLOCK_X=v_block_x, BLOCK_Y=v_block_y, num_warps=v_warps, enable_fp_fusion=False,
         )
     return output

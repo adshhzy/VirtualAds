@@ -1,6 +1,7 @@
 """原 paste_gpu 签名 -> paste_gpu_batch / paste_gpu_bucketed 的图外适配器。
 
-与 paste_gpu_batch.py 放在同一目录。最低需要 Python 3.10 / PyTorch 2.x。
+与 paste_gpu_batch.py 放在同一目录。源码兼容 Python 3.9+；PyTorch / Triton
+须与实际 Python / CUDA 环境匹配，本机 GPU 验证环境为 Python 3.12。
 新增方法保留入参签名，默认返回 numpy uint8；B=1时为[H,W,3]，兼容原paste_gpu，
 B>1时为[B,H,W,3]，每张图可通过results[b]取出。显式squeeze_single=False保留batch。
 
@@ -66,15 +67,25 @@ B>1时为[B,H,W,3]，每张图可通过results[b]取出。显式squeeze_single=F
 * acceleration='eager'保留PyTorch算子；'auto'在CUDA且Triton可用时融合
   单应采样/ROI写入与最终融合；'triton'要求可用，否则明确报错。
   需与新版paste_gpu_batch.py及paste_gpu_kernels.py同时部署；首次JIT不计稳态。
-  反射边界的单应采样仍走PyTorch；全图畸变和运动模糊仍走PyTorch。
+  反射边界的单应采样和全图畸变仍走PyTorch；模糊按blur_backend选择
+  PyTorch、dense Triton或separable路径。
 * pinned_output=True是可选D2H优化；为每个结果分配独立固定页Tensor，拷回并
   等待完成后返回其numpy视图，不再做第二次CPU复制。numpy持有底层Tensor，
   调用者仍持有结果时不会被下一帧覆写。默认关闭，需目标机A/B实测；若下游
   长时间积压结果，固定页内存占用也会相应增加，释放后的块由PyTorch管理复用。
+* batch_chunk_size='auto'默认查询离线实测配置，未知硬件/尺寸/布局/B回退整批。
+  0强制原整批；正整数在B更大时按此上限分块，尾块不补齐。
+  手动分块仅支持backend='batch'、CUDA、return_numpy=True、pinned_output=True。
+  共享准备只执行一次；当前计算流顺序渲染，各块通过独立复制流写入本次专属的
+  固定页结果，全部复制完成后返回。无广告早返回不分块，B不大于上限时仍走整批。
+  分块不会改变输出所有权，也不保证更快；需按实际B、画面和设备测量。
+  last_execution记录本次选择和回退原因；blur_launch_config可显式配置两个
+  separable核的启动参数。未知的手动blur覆盖会使auto回退整批。
 * profile_every=N每N帧采样一次；last_profile和profile_summary()包含CPU与
   CUDA流事件计时。采样有同步成本，正式测速/生产关闭；先完成JIT/预热。
   CUDA事件包含流空闲/CPU供给间隙；export_cpu_ms还包含等待前面GPU工作，
   不能把CPU与CUDA分项相加。total_ms是采样帧的同步端到端耗时。
+  分块时core/export对应重叠工作提交与最终等待，不能视为独立的计算/复制耗时。
 """
 
 from __future__ import annotations
@@ -103,7 +114,7 @@ else:
         paste_gpu_bucketed, validate_inputs,
     )
 
-ADAPTER_VERSION = "2026-10-21-perf4.1"
+ADAPTER_VERSION = "2026-10-21-perf4.2-dynamic"
 
 
 @dataclass(frozen=True)
@@ -141,6 +152,8 @@ class AdapterOptions:
     area_caps: tuple[int, ...] | None = None
     distortion_grid_builder: Callable | None = None
     warp_grids_builder: Callable | None = None  # 可选批量网格构造，按实际素材尺寸生成
+    batch_chunk_size: int | str = "auto"  # auto离线配置；0整批；正整数为手动分块上限
+    blur_launch_config: tuple | None = None  # 显式覆盖separable横纵启动参数，默认由auto配置选择
 
 
 def _choose_plan(shape, candidates, name):
@@ -275,6 +288,19 @@ def _effective_ad_hw(actual_hw, declared_hw, check_ad_h_w, resize_ads, name):
     return tuple(actual_hw)
 
 
+def _slice_batch_args(args, start, stop):
+    """Slice validated core inputs along B, retaining singleton broadcast views."""
+    frames, ads, grids, distortion, kernel, mask, opacity = args
+
+    def take(value):
+        return value if value.shape[0] == 1 else value[start:stop]
+
+    return (take(frames), tuple(ad[start:stop] for ad in ads),
+            tuple(take(grid) for grid in grids), take(distortion),
+            kernel[start:stop] if kernel.ndim == 5 else kernel,
+            take(mask), tuple(take(value) for value in opacity))
+
+
 class _FrameTiming:
     """仅采样时创建。事件按调用者当前流记录，不对其它设备做全局同步。"""
     def __init__(self, started, device):
@@ -353,6 +379,17 @@ class PasteBatchAdapter:
             raise ValueError("blur_backend must be torch, triton or separable")
         if type(opt.profile_every) is not int or opt.profile_every < 0:
             raise ValueError("profile_every must be a nonnegative integer")
+        if opt.batch_chunk_size != "auto" and (type(opt.batch_chunk_size) is not int or opt.batch_chunk_size < 0):
+            raise ValueError("batch_chunk_size must be 'auto' or a nonnegative Python integer")
+        if opt.batch_chunk_size != "auto" and opt.batch_chunk_size and (opt.backend != "batch" or
+                not opt.return_numpy or not opt.pinned_output):
+            raise ValueError("batch_chunk_size requires backend='batch', return_numpy=True and pinned_output=True")
+        if opt.blur_launch_config is not None:
+            if __package__:
+                from .paste_gaussian_kernels import _resolve_launch_config
+            else:
+                from paste_gaussian_kernels import _resolve_launch_config
+            _resolve_launch_config(opt.blur_launch_config)
         if opt.grid_source not in ("prefer_grid", "matrix"):
             raise ValueError("grid_source must be prefer_grid or matrix")
         if opt.matrix_coordinates not in (None, "roi", "canvas"):
@@ -371,8 +408,10 @@ class PasteBatchAdapter:
         self._layout = None
         self._scalar_maps = OrderedDict()
         self._host_events = {}             # 只复用完成事件；不复用仍由调用者持有的输出
+        self._chunk_transfers = {}         # 每设备一个内部复制流和可复用的生产完成事件
         self._call_count = 0
         self.last_profile = None
+        self.last_execution = None
         self._profile_samples = []
 
     def invalidate_assets(self):
@@ -600,6 +639,50 @@ class PasteBatchAdapter:
         # ndarray.base持有Tensor，底层内存直到下游释放结果后才可由allocator复用。
         return host.numpy()
 
+    def _render_chunked_numpy(self, args, boxes, core_options, chunk_size, timing=None):
+        """Overlap per-chunk D2H with later rendering; return a completed private host array."""
+        frames, ads = args[:2]
+        batch = ads[0].shape[0]
+        device = frames.device
+        with torch.cuda.device(device):
+            compute_stream = torch.cuda.current_stream(device)
+            key = str(device)
+            state = self._chunk_transfers.get(key)
+            if state is None:
+                state = (torch.cuda.Stream(device=device), [])
+                self._chunk_transfers[key] = state
+            copy_stream, produced_events = state
+            host = torch.empty((batch, *frames.shape[-2:], 3), dtype=torch.uint8,
+                               device="cpu", pin_memory=True)
+            # Keep all source allocations alive through the final copy, including
+            # exceptions after an earlier chunk has already started its transfer.
+            outputs = []
+            try:
+                for index, start in enumerate(range(0, batch, chunk_size)):
+                    stop = min(start + chunk_size, batch)
+                    output = _paste_gpu_batch(*_slice_batch_args(args, start, stop),
+                                              bboxes=boxes, **core_options)
+                    outputs.append(output)
+                    if index == len(produced_events):
+                        produced_events.append(torch.cuda.Event())
+                    produced = produced_events[index]
+                    produced.record(compute_stream)
+                    with torch.cuda.stream(copy_stream):
+                        copy_stream.wait_event(produced)
+                        host[start:stop].copy_(output, non_blocking=True)
+                if timing is not None:
+                    # The current-stream event marks the compute tail; D2H has
+                    # already overlapped it. The next interval is only the tail
+                    # remaining after all chunks were submitted, not total D2H.
+                    timing.mark()
+            finally:
+                # This stream is private to the adapter. Even an exception must
+                # finish outstanding reads/writes before host/outputs can die.
+                copy_stream.synchronize()
+        if self.options.squeeze_single and batch == 1:
+            host = host[0]
+        return host.numpy()
+
     @torch.inference_mode()
     def __call__(self, owner, frame_input, data_dict: dict, frame_id: int, way_id: int, paste_args):
         """有状态执行器；通过文末方法包装后，外部调用签名与原paste_gpu相同。"""
@@ -618,6 +701,8 @@ class PasteBatchAdapter:
 
         # 无广告时不要求paste_args有效，保持原函数的早返回能力。
         if not params:
+            self.last_execution = dict(batch=batch, chunk_size=0, blur_launch_config=None,
+                                       reason="no_ads")
             tensor = _as_tensor(frame_input,None)
             timing = _FrameTiming(started,tensor.device) if sampled else None
             frame = _apply_plan(tensor, _image_plan(tensor.shape,3,opt.frame_layout,"frame_input"),
@@ -644,6 +729,8 @@ class PasteBatchAdapter:
                              contiguous=not opt.optimize_views)
         # 未带index的'cuda'统一到实际分配设备，避免缓存键与设备检查不一致。
         device = frames.device
+        if opt.batch_chunk_size != "auto" and opt.batch_chunk_size and device.type != "cuda":
+            raise ValueError("batch_chunk_size requires CUDA for calls with advertisements")
         if frames.shape[0] not in (1,batch):
             raise ValueError(f"background batch={frames.shape[0]}, expected 1 or {batch}")
         hw = tuple(frames.shape[-2:])
@@ -708,14 +795,35 @@ class PasteBatchAdapter:
             kernel = kernel.contiguous()
         args = (frames,ads,tuple(grids),distortion,kernel,mask,tuple(opacity))
         validate_inputs(args,boxes)
+        if opt.batch_chunk_size == "auto":
+            if __package__:
+                from .paste_execution_policy import choose_execution
+            else:
+                from paste_execution_policy import choose_execution
+            chunk_size, blur_config, reason = choose_execution(args, boxes, opt, blur_factors)
+        else:
+            chunk_size, blur_config, reason = opt.batch_chunk_size, None, "explicit"
+        if opt.blur_launch_config is not None:
+            if opt.batch_chunk_size == "auto" and tuple(opt.blur_launch_config) != tuple(blur_config or (128, 4, 4, 128, 4, 4)):
+                chunk_size, reason = 0, "unmeasured_blur_override"
+            blur_config = opt.blur_launch_config
+        self.last_execution = dict(batch=batch, chunk_size=chunk_size,
+                                   blur_launch_config=blur_config, reason=reason)
         options = dict(warp_align_corners=opt.warp_align_corners,
             distortion_align_corners=opt.distortion_align_corners,
             warp_padding_mode=opt.warp_padding_mode,
             distortion_padding_mode=opt.distortion_padding_mode,legacy_alpha=opt.legacy_alpha,
-            acceleration=opt.acceleration, blur_backend=opt.blur_backend, blur_factors=blur_factors)
+            acceleration=opt.acceleration, blur_backend=opt.blur_backend, blur_factors=blur_factors,
+            blur_launch_config=blur_config)
         if opt.backend == "batch":
             if timing is not None:
                 timing.mark()
+            if chunk_size and batch > chunk_size:
+                result = self._render_chunked_numpy(args, boxes, options, chunk_size, timing)
+                if timing is not None:
+                    timing.mark()
+                    self._record_profile(timing,frame_id,batch,len(params),cache_before)
+                return result
             output = _paste_gpu_batch(*args,bboxes=boxes,**options)
         else:
             layout_key = (boxes,hw,str(device),tuple(tuple(ad.shape[-2:]) for ad in ads),opt.area_caps)
