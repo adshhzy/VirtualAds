@@ -3,6 +3,7 @@
 Both versions run in one process with identical seeded inputs, separate mutable
 camera state, and rotating measurement order. Includes synchronous NumPy output.
 The baseline adapter and shared builder are imported from an isolated package.
+--entry-point selects the current path only; the isolated baseline stays legacy.
 """
 
 from __future__ import annotations
@@ -47,6 +48,12 @@ def parse_arguments():
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--iterations", type=int, default=100)
     parser.add_argument("--device", default="cuda:0")
+    parser.add_argument(
+        "--entry-point",
+        choices=("legacy", "render_frame"),
+        default="legacy",
+        help="current implementation entry point; baseline keeps explicit preparation",
+    )
     parser.add_argument("--output", type=Path, required=True)
     options = parser.parse_args()
     if (
@@ -156,6 +163,8 @@ class ComparisonCase:
             optimized=True,
             separable=True,
         )
+        if options.entry_point == "render_frame":
+            self.current.enable_public_api()
         self.current_options = self.current.adapter.options
 
     def select(self, name):

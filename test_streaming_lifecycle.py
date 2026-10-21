@@ -14,7 +14,7 @@ import weakref
 import numpy as np
 import torch
 
-import paste_gpu_batch_adapter as adapter_module
+import paste_render_executor as adapter_module
 from paste_asset_cache import DEFAULT_MAX_CACHED_BYTES, SizeAssetCache
 from paste_gpu_batch_adapter import AdapterOptions, PasteBatchAdapter, _SizeAssetCache
 

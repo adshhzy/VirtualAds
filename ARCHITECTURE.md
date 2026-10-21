@@ -1,24 +1,27 @@
 # 代码阅读与修改指南
 
-当前版本 `2026-10-21-perf4.5-streaming`。这是 GPU 贴图库和基准工具，不含视频解码、编码、推流或常驻服务。
+当前版本 `2026-10-21-perf4.6-render-api`。这是 GPU 贴图库和基准工具，不含视频解码、编码、推流或常驻服务。
 这里的 **B（路数）是同一画面/布局下的素材组数**；每组产生一张结果，不等同于任意独立摄像机的并发数。
-本轮直播资源生命周期、测量方法及验收状态见 [STREAMING_REVIEW.md](STREAMING_REVIEW.md)。[BUCKETED_OPTIMIZATION_REVIEW.md](BUCKETED_OPTIMIZATION_REVIEW.md) 保留 perf4.4 桶优化结果；[BACKEND_COMPARISON_REVIEW.md](BACKEND_COMPARISON_REVIEW.md) 保留更早的旧桶观察。
+本轮统一入口、兼容边界及验收状态见 [RENDER_API_REVIEW.md](RENDER_API_REVIEW.md)。本轮调整接口职责，不改变数值内核、策略表或声称性能提升。[STREAMING_REVIEW.md](STREAMING_REVIEW.md) 保留 perf4.5 生命周期和测量结果；更早报告继续作为对应版本记录。
 
 ## 先从哪里读
 
-1. [shared_paste_example.py](shared_paste_example.py)：worker 初始化、每帧共享准备和业务调用位置。
-2. [paste_gpu_batch_adapter.py](paste_gpu_batch_adapter.py) 的 `PasteBatchAdapter.__call__`：从业务输入到 NumPy 输出的主流程。
+1. [paste_renderer.py](paste_renderer.py)：业务入口 `initialize_renderer`、`render_frame`、`release_renderer`。
+2. [paste_render_executor.py](paste_render_executor.py) 的 `RenderExecutor.render_prepared`：输入准备、缓存、后端执行与 NumPy 导出。
 3. [paste_gpu_batch.py](paste_gpu_batch.py) 的 `paste_gpu_batch` / `_finish_canvas`：纯 Tensor 运算与后端选择。
 4. 再按需求查看共享几何、缓存、执行策略或具体 Triton 内核。
 
-动态业务接入可直接参考 [dynamic_paste_example.py](dynamic_paste_example.py)：`initialize_dynamic_worker` 调用一次，随后复用对象调用 `render_dynamic_frame`，B 由当前素材组列表决定。示例不提供合成业务回调；B=0由调度方跳过，B1继续返回HWC。已用合成测试数据验证1→3→8→5→12→1与整批逐字节一致，以及旧输出存活、way专用无广告优先和空B拒绝，记录见 `results/dynamic_business_example.json`。
+新业务每帧直接调用 `render_frame`，B 由当前素材组列表决定；B=0 由调度方跳过，B1 继续返回 HWC。[dynamic_paste_example.py](dynamic_paste_example.py) 和 [shared_paste_example.py](shared_paste_example.py) 保留旧函数，转调同一份新实现。它们不提供合成业务回调，也不维护另一套缓存。完整业务循环及返回值兼容说明见 [RENDER_API_REVIEW.md](RENDER_API_REVIEW.md)。
 
 ```mermaid
 flowchart TD
-    A[业务帧、相机参数、素材组] --> B[SharedParameterBuilder.prepare]
+    A[业务帧、相机参数、素材组] --> R[paste_renderer.render_frame]
+    R --> Q{当前 way 有广告}
+    Q -->|是| B[SharedParameterBuilder.prepare]
+    Q -->|否| N[执行器背景返回]
+    N --> J[同步导出独立 NumPy]
     B --> C[六项 paste_args]
-    A --> D[PasteBatchAdapter.__call__]
-    C --> D
+    C --> D["executor(...) → 标准 __call__ → render_prepared"]
     D --> E[整理素材、ROI 网格、mask 和模糊核]
     E --> F[choose_execution：整批或分块]
     F --> G[paste_gpu_batch：逐广告位处理 B 组]
@@ -26,18 +29,20 @@ flowchart TD
     G --> H[_finish_canvas：畸变、模糊、融合]
     K --> H
     H --> I[GPU BHWC uint8]
-    I --> J[同步导出独立 NumPy]
+    I --> J
 ```
 
 ## 文件职责
 
 | 文件 | 负责什么 | 适合在这里修改什么 |
 |---|---|---|
-| `shared_paste_example.py` | 业务对象接入，初始化 builder/adapter | worker 接入方式 |
+| `paste_renderer.py` | 统一初始化、每帧共享准备和整体释放 | 新业务调用边界与 owner 接入 |
+| `paste_render_executor.py` | `RenderOptions` / `RenderExecutor`，输入布局、缓存、执行和输出 | 执行阶段实现及输入契约 |
+| `shared_paste_example.py` / `dynamic_paste_example.py` | 旧初始化/准备/动态示例函数，委托统一实现 | 旧业务兼容与迁移示意 |
 | `paste_camera_filter.py` | CPU 相机历史选择、滤波、可选有界历史容器 | 相机数据校验、历史生命周期；滤波行为变更须单独验收 |
 | `paste_shared_params.py` | 共享畸变网格、ROI 网格、精确 sigma 核缓存 | 共享准备和缓存实现 |
 | `paste_shared_types.py` | `MotionKernelSpec`：二维核与已验证的一维因子 | 共享数据契约 |
-| `paste_gpu_batch_adapter.py` | 输入布局、素材缓存、执行编排、NumPy 所有权 | 业务接口适配和输出策略 |
+| `paste_gpu_batch_adapter.py` | 旧类名、函数和 helper 导入兼容 | 兼容别名；不另行维护执行实现 |
 | `paste_asset_cache.py` | 历史素材 stack 的尺寸/条目/字节 LRU 与源身份引用 | 缓存预算、revision 清理和保留量诊断 |
 | `paste_execution_policy.py` | 离线实测配置的匹配与回退 | 新硬件/布局/B 的实测策略 |
 | `paste_gpu_batch.py` | 纯 Tensor 贴图流程，batch/bucketed，后端路由 | GPU 阶段组织和参考路径 |
@@ -45,13 +50,15 @@ flowchart TD
 | `paste_gaussian_kernels.py` | 横纵可分离模糊与最终融合 | 两阶段启动参数和内核 |
 | `paste_shared_kernels.py` | Triton 畸变和 ROI 网格生成 | 几何网格内核 |
 
-运行时代码不依赖 benchmark 或测试文件；共享准备和 adapter 共同使用 `MotionKernelSpec`。
-保留平铺文件和原导入路径，已有业务代码不需要迁移包名。
+运行时代码不依赖 benchmark 或测试文件；共享准备和执行器共同使用 `MotionKernelSpec`。`AdapterOptions is RenderOptions`、`PasteBatchAdapter is RenderExecutor`，旧类名是同一类的别名，不是子类或包装实例。旧的平铺/包导入和函数调用继续保留。
+
+owner 上仍使用 `_paste_batch_adapter` 和 `_shared_paste_builder` 两个兼容存储位，分别保存唯一执行器与唯一 builder。统一入口不新增第二份 renderer 状态、素材缓存或输出缓冲。
 
 ## 一帧如何走完
 
-`setup_shared_paste` 在 worker 内执行一次；builder 和 adapter 后续复用。
-`prepare_shared_paste_args` 每帧读取实时 K/畸变/运动参数，输出以下原有六项元组：
+`initialize_renderer(owner, base_options, ...)` 在 worker 内执行一次，返回 `RenderExecutor`；builder 和执行器后续复用。`render_frame` 依次处理当前素材组/历史引用、当前 way 的广告位选择和无广告分支。省略 `material_groups` / `camera_history` 时沿用 owner 现有字段，显式空素材组拒绝；非 None 的 `ad_params_{way_id}` 优先于通用 `ad_params`。
+
+有广告时，入口每帧进行一次共享准备，读取实时 K/畸变/运动参数。没有传入 `camera_result` 时才调用相机历史滤波；多设备共享同一次 CPU 相机结果时可显式传入。内部仍得到以下兼容六项元组，但新业务无需自行拼接：
 
 ```python
 (device, distortion_grid, filtered_coefficients,
@@ -59,9 +66,9 @@ flowchart TD
 ```
 
 `motion_kernel` 可以是原 Tensor，或带已验证因子的 `MotionKernelSpec`。元组顺序保持兼容。
-实际素材尺寸明确后，adapter 才生成每个广告位的 ROI 网格。
+共享准备先完成全图畸变与运动核。实际素材尺寸在执行器收集后才明确，随后才通过 builder 回调生成每个广告位当前 ROI 网格。该顺序保留实际 source 高宽和实时 `m_inv`，不会按 frame_id 提前复用旧网格。
 
-`PasteBatchAdapter.__call__` 现在主要编排以下步骤：
+`RenderExecutor.render_prepared` 承接原 `PasteBatchAdapter.__call__` 主体；标准类 `__call__` 按原签名转调它。统一入口调用 `executor(...)`，因此旧子类对 `__call__` 的覆盖仍有效。以下步骤仍由执行器负责：
 
 | 阶段 | 方法 | 边界 |
 |---|---|---|
@@ -77,7 +84,7 @@ GPU 核心先按广告位顺序覆盖 RGBA 画布，再做全图畸变、模糊�
 `_finish_canvas` 明确区分 `torch`、dense `triton` 和 `separable` 三条模糊路径。
 不可交换 ROI 写入顺序、alpha 运算顺序或模糊位置，它们会改变画面。
 
-输入的局部形状、广播和设备契约由对应准备阶段校验，adapter 不再在进入 core 前重复扫描同一组已准备 Tensor。独立调用 core 的代码仍须使用公开 `validate_inputs()`。素材图像和 mask/透明度的布局计划只缓存 shape、布局和排列/广播操作等 CPU 元数据；缓存不保存这些动态 map 的值，每次仍应用于当前输入。
+输入的局部形状、广播和设备契约由对应准备阶段校验，执行器保留 perf4.5 对重复扫描的处理。独立调用 core 的代码仍须使用公开 `validate_inputs()`。素材图像和 mask/透明度的布局计划只缓存 shape、布局和排列/广播操作等 CPU 元数据；缓存不保存这些动态 map 的值，每次仍应用于当前输入。
 
 batch core 已逐 slot 判断 Triton 支持条件和 padding 模式后，使用私有 `_warp_paste_into_supported` 启动，省去公开包装器的重复支持检查。公开 `warp_paste_into` 仍保留检查；两条入口共用同一展开、stride、启动参数和设备数学。业务代码应调用公开 API，不直接调用这个私有入口。
 
@@ -146,13 +153,13 @@ Tensor 的 stride 和广播视图有实际性能意义，不要为了整洁随�
 - 分块路径仍在调用方计算流串行计算；内部复制流等对应事件后复制。GPU 源和 host 结果一直存活到复制完成，正常返回与异常退出都同步复制流。
 - 每个 worker 使用自己的实例，调用方按同一计算流串行调用。跨流生产输入需先建立依赖。
 
-在两次调用之间或 worker 退出时，`builder.release_resources()` 清 Gaussian 缓存、上下文身份引用与统计；`adapter.release_resources()` 等待内部复制流完成，清素材、布局、map 缓存、事件/复制流引用与诊断状态。它们均可随后重新使用，不清业务历史、不覆盖旧输出、不调用全局 `empty_cache()`。`invalidate_assets()` 只用于素材失效，不能代替完整 worker 释放。业务还需释放自己持有的输入、队列及 `history`。
+在两次调用之间或 worker 退出时，业务调用 `release_renderer(owner)`，统一释放现有 builder 与执行器。内部仍由 builder 清 Gaussian 缓存/身份引用，由执行器等待复制完成并清素材、布局、map、事件/流引用与诊断状态。对象保留，可随后重新使用；释放不清业务历史、不覆盖旧输出、不调用全局 `empty_cache()`。原 `release_resources()` 方法继续可用。`invalidate_assets()` 只用于素材失效，不能代替完整 worker 释放。业务还需释放自己持有的输入、队列及 `history`。
 
 `cache_info()` 的 `bytes` 是历史 stack 逻辑字节数，`current_bytes`/`bucket_bytes` 分别记录当前素材和桶素材，`retained_stack_bytes` 对三者的 Tensor 引用去重；不要直接把前三者相加。计数不含源 storage、LUT、临时工作区、输出或分配器保留量。检查长期增长需同时观察进程内存、CUDA allocated/reserved、固定页分配器和业务保留队列；`reserved` 高于 `allocated` 或释放后工作集未立即下降，本身不能证明泄漏。
 
 `batch_chunk_size="auto"` 只匹配离线表；`0` 整批；正整数手动分块。默认后端仍为 `batch`，也不强行启用可分离模糊。
 当前策略表沿用上一版：新增分块档位限定在 B8/B16、4/16 广告位、已测源尺寸循环、108×320 ROI 等条件内，继续检查既有硬件、软件和 Tensor 布局。
-精确准入表以 [paste_execution_policy.py](paste_execution_policy.py) 为准，不能从广告位数或 B 单独推断；32 广告位不在此承诺内。本轮直播整理未改动策略表。
+精确准入表以 [paste_execution_policy.py](paste_execution_policy.py) 为准，不能从广告位数或 B 单独推断；32 广告位不在此承诺内。本轮接口整理未改动策略表。
 [动态路数报告](DYNAMIC_BATCH_REVIEW.md) 保留早期策略的历史测量。
 
 ## 基准与回归工具
@@ -164,6 +171,7 @@ Tensor 的 stride 和广播视图有实际性能意义，不要为了整洁随�
 | `scripts/run.ps1 check-backends` | `check_backend_contracts.py` | 布局归属、透明覆盖、广播输入、动态几何/素材缓存及旧输出所有权对照 |
 | `scripts/run.ps1 check-policy` | `test_backend_policy.py` | CPU 元数据测试；验证自动策略完整结构匹配、未知输入回退及原有档位优先 |
 | `scripts/run.ps1 check-streaming` | `check_streaming_stability.py` | 持续输入变化、历史/缓存/输出保留与释放后的资源采样；不代替生产负载验收 |
+| 项目 Python `-B -m unittest test_render_api` | `test_render_api.py` | 公共入口、旧别名/函数、每帧一次准备、动态输入、无广告及释放重用；默认 CPU，指定 `PASTE_TEST_DEVICE=cuda:0` 增加真实公开初始化 GPU 检查 |
 | 项目 Python `-m unittest test_streaming_history test_streaming_lifecycle` | 两个 CPU 生命周期测试 | 相机邻域数值、历史容量、revision/owner 释放、预算与元数据缓存 |
 | `scripts/run.ps1 batch` | `benchmark_paste_gpu_batch.py` | 核心、adapter、dense 内核及诊断 |
 | `scripts/run.ps1 check` | `test_dynamic_batch.py` | 广播、尾块、动态 B、缓存和输出生命周期 |
@@ -175,7 +183,9 @@ Tensor 的 stride 和广播视图有实际性能意义，不要为了整洁随�
 基准使用合成运动/sigma/Gaussian 回调，不代表真实业务。不要把独立阶段计时相加，也不要把跨轮数字当收益。
 
 上一轮旧 bucketed 的 108 场景筛查中，104 个场景最大差 1 级 uint8，另外 4 个逐字节一致场景更慢。
-该历史观察见 [BACKEND_COMPARISON_REVIEW.md](BACKEND_COMPARISON_REVIEW.md)，不能作为当前内核与缓存实现的结论；perf4.4 结果见 [BUCKETED_OPTIMIZATION_REVIEW.md](BUCKETED_OPTIMIZATION_REVIEW.md)，本轮直播测试状态见 [STREAMING_REVIEW.md](STREAMING_REVIEW.md)。
+该历史观察见 [BACKEND_COMPARISON_REVIEW.md](BACKEND_COMPARISON_REVIEW.md)，不能作为当前内核与缓存实现的结论；perf4.4 结果见 [BUCKETED_OPTIMIZATION_REVIEW.md](BUCKETED_OPTIMIZATION_REVIEW.md)，perf4.5 直播记录见 [STREAMING_REVIEW.md](STREAMING_REVIEW.md)。本轮接口对照见 [RENDER_API_REVIEW.md](RENDER_API_REVIEW.md)。
+
+`compare` 和 `check-streaming` 可显式选择 `--entry-point render_frame`，让当前版本通过统一入口完成渲染；默认 `legacy` 保留原调用路线。该参数只切换 current，隔离旧源码的 baseline/oracle 继续使用旧共享准备加 adapter，不借用当前入口或缓存。报告的 `arguments.entry_point` 记录此选择。
 
 `backends` 的计时从共享准备开始，到独立 NumPy 返回且 GPU 完成为止；只把合成源输入更新放在计时外。
 各候选持有独立 builder/adapter 和可变相机状态，并在下一次返回前保留上一次输出。
@@ -216,4 +226,4 @@ Tensor 的 stride 和广播视图有实际性能意义，不要为了整洁随�
 
 新增处理优先放在负责该阶段的现有函数附近。内核保留数学坐标和 stride 命名；host 代码使用能说明职责的名称。
 更改执行策略必须补完整 NumPy 对照；更改数值核必须补原算法/旧源码对照，不依靠逐轮放宽容差。
-本轮验收状态见 [STREAMING_REVIEW.md](STREAMING_REVIEW.md)；此前桶优化、后端对比和可读性重构记录分别保留在 [BUCKETED_OPTIMIZATION_REVIEW.md](BUCKETED_OPTIMIZATION_REVIEW.md)、[BACKEND_COMPARISON_REVIEW.md](BACKEND_COMPARISON_REVIEW.md) 和 [READABILITY_REVIEW.md](READABILITY_REVIEW.md)。
+本轮验收状态见 [RENDER_API_REVIEW.md](RENDER_API_REVIEW.md)；此前生命周期、桶优化、后端对比和可读性重构记录继续保留在相应历史报告中。

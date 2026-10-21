@@ -1,13 +1,15 @@
 # VirtualAds
 
-VirtualAds 是 PyTorch / Triton GPU 广告贴图库和命令行基准程序，没有 Web 服务或浏览器界面。当前版本为 `2026-10-21-perf4.5-streaming`。
+VirtualAds 是 PyTorch / Triton GPU 广告贴图库和命令行基准程序，没有 Web 服务或浏览器界面。当前版本为 `2026-10-21-perf4.6-render-api`。
 
-本轮整理直播长期运行的缓存上限、输入准备和资源释放。默认后端仍为 `batch`，既有 `auto` 分块策略表保持不变。
-先读 [代码阅读与修改指南](ARCHITECTURE.md)；本机 12 场景完整调用平均耗时下降 0.64%～6.72%，具体条件及持续运行验收状态见 [直播运行报告](STREAMING_REVIEW.md)。上一轮桶优化结果保留在 [桶优化报告](BUCKETED_OPTIMIZATION_REVIEW.md)，不据此自动切换到 bucketed。
+新业务统一调用 `paste_renderer.render_frame`：worker 初始化一次，每帧由入口完成共享准备与渲染，退出时统一释放。原执行实现迁至 `RenderExecutor`，旧 adapter 名称和调用方式继续兼容。本轮是接口组织调整，未修改 GPU 数学、默认 `batch` 或既有 `auto` 策略，也不宣称性能提升。
+先读 [代码阅读与修改指南](ARCHITECTURE.md) 和 [统一渲染接口说明](RENDER_API_REVIEW.md)。perf4.5 的性能/长期运行证据保留在 [直播运行报告](STREAMING_REVIEW.md)，不作为本轮新增收益。
 
-[dynamic_paste_example.py](dynamic_paste_example.py) 展示业务 worker 初始化一次、每帧更新素材组/相机参数并返回原 NumPy 接口；沿用真实业务回调。
+本轮 59 项单元测试及既有 GPU 回归通过；公开入口完成 10000 帧合成长测，42 次旧源码抽查画面与策略一致。完整调用均值在四个 B 档位有升有降，不据此宣称提速；采样范围、内存观察及限制见 [本轮验收记录](RENDER_API_REVIEW.md)。
 
-直播接入可显式使用 `BoundedCameraHistory(capacity=9)`，按单调帧号写入独立相机记录，并给下游输出队列设置容量。素材历史 stack 默认预算为 512 MiB，当前素材工作集与桶打包存储另计，这不是进程总内存上限。worker 退出时调用 builder 和 adapter 的 `release_resources()`；具体循环示例、10000 帧观察及仍未确定根因的编译异常见 [直播运行报告](STREAMING_REVIEW.md)。
+[dynamic_paste_example.py](dynamic_paste_example.py) 与 [shared_paste_example.py](shared_paste_example.py) 保留旧业务辅助函数并委托统一入口；新调用方式见下方“接入与迭代约束”。所有方式均沿用真实业务回调。
+
+直播接入可显式使用 `BoundedCameraHistory(capacity=9)`，按单调帧号写入独立相机记录，并给下游输出队列设置容量。素材历史 stack 默认预算为 512 MiB，当前素材工作集与桶打包存储另计，这不是进程总内存上限。worker 退出时调用 `release_renderer(owner)`，业务继续负责历史和输出队列；新入口循环示例见 [统一渲染接口说明](RENDER_API_REVIEW.md)。此前 10000 帧观察及未定根因编译异常保留在 [直播运行报告](STREAMING_REVIEW.md)。
 
 格式与静态检查使用 Ruff 0.14.1，运行于独立 uv 工具环境；新克隆的通用命令见下文，不改 GPU 依赖。
 
@@ -19,8 +21,9 @@ VirtualAds 是 PyTorch / Triton GPU 广告贴图库和命令行基准程序，�
 |---|---|
 | 安装、运行与基线恢复 | 本页下面的步骤 |
 | 一帧执行顺序、模块职责、形状与缓存 | [ARCHITECTURE.md](ARCHITECTURE.md) |
-| 直播循环、性能、长期运行与已知限制 | [STREAMING_REVIEW.md](STREAMING_REVIEW.md) |
-| 动态素材组接入 | [dynamic_paste_example.py](dynamic_paste_example.py)、[shared_paste_example.py](shared_paste_example.py) |
+| 统一入口、业务循环与旧接口迁移 | [RENDER_API_REVIEW.md](RENDER_API_REVIEW.md)、[paste_renderer.py](paste_renderer.py) |
+| perf4.5 性能、长期运行与已知限制 | [STREAMING_REVIEW.md](STREAMING_REVIEW.md) |
+| 兼容旧业务辅助函数 | [dynamic_paste_example.py](dynamic_paste_example.py)、[shared_paste_example.py](shared_paste_example.py) |
 | Codex / 开发者修改约束与回归 | [AGENTS.md](AGENTS.md) |
 | 较早版本的验证记录 | [桶优化](BUCKETED_OPTIMIZATION_REVIEW.md)、[后端对比](BACKEND_COMPARISON_REVIEW.md)、[初次部署](VALIDATION.md) |
 
@@ -127,6 +130,7 @@ Expand-Archive -LiteralPath $archivePath -DestinationPath $baselinePath -ErrorAc
 
 | `$baselineCommit` | `$baselineFolder` | 对照入口 |
 |---|---|---|
+| `4b2b311` | `baseline_render_api_4b2b311` | 本轮接口迁移前的源码；用于统一入口与旧完整流程逐字节对照 |
 | `6edf109` | `baseline_streaming_6edf109` | `check-streaming --baseline results/baseline_streaming_6edf109`；`compare --baseline results/baseline_streaming_6edf109 --baseline-label before` |
 | `9c6e930` | `baseline_bucketed_9c6e930` | `backends --baseline results/baseline_bucketed_9c6e930 --candidates before_bucketed bucketed batch_whole` |
 | `3ecc3b7` | `baseline_backend` | 较早 auto 扩张对照：`compare --baseline results/baseline_backend --baseline-label before_auto` |
@@ -147,6 +151,7 @@ perf4.4 筛查覆盖 B=1/4/8/16、4/16/32 个广告位、1～3 种素材尺寸�
 | `scripts/run.ps1 check-policy` | `test_backend_policy.py` | CPU 元数据测试，检查策略精确准入与未知输入回退 |
 | `scripts/run.ps1 compare` | `benchmark_dynamic_comparison.py` | 隔离加载旧源码对照当前完整调用；`--slots` 指定广告位数，默认 16 |
 | `scripts/run.ps1 check-streaming` | `check_streaming_stability.py` | 检查持续输入变化、输出生命周期和资源保留；使用方法见直播报告 |
+| 项目 Python `-B -m unittest test_render_api` | `test_render_api.py` | 公共入口与旧接口兼容；默认 CPU，GPU 验收方式见统一接口报告 |
 
 ```powershell
 .\scripts\run.ps1 backends --batches 8 --slots 16 --profiles three --layouts static --check-timed-steps
@@ -161,21 +166,40 @@ perf4.4 筛查覆盖 B=1/4/8/16、4/16/32 个广告位、1～3 种素材尺寸�
 ```
 
 `--baseline` 指向按上节恢复的源码目录，`before_bucketed` 使用其中独立加载的运行时；恢复只需 Git 历史，不需要原测试机器的 `results/`。
+`compare` / `check-streaming` 的 `--entry-point render_frame` 可检查当前公共入口，隔离 baseline 仍使用旧调用路线；默认 `legacy` 保留原工具行为。本轮 `4b2b311` 对照命令见 [统一接口报告](RENDER_API_REVIEW.md)。
 `backends` 默认检查第 0、1、7 帧；确认策略时使用 `--check-timed-steps` 覆盖实际计时帧，零差异门槛只对报告中的 `checked_steps` 成立。
 `--require-exact` 指定的候选出现任何非零像素差即失败；旧桶可保留差异记录。冷素材单次耗时、独立诊断与确认测量的使用方式见 [ARCHITECTURE.md](ARCHITECTURE.md) 和 [桶优化报告](BUCKETED_OPTIMIZATION_REVIEW.md)。
 
 ## 接入与迭代约束
 
-生产接入入口是 `shared_paste_example.py`，调用 `setup_shared_paste` 初始化 worker，再每帧调用 `prepare_shared_paste_args` 与 adapter。需要接入现有业务对象和真实数据，不能把基准 fixture 当成生产应用。
+生产接入以 `paste_renderer` 为主入口。保留业务原有的布局、通道、alpha、缩放等选项，在 worker 内调用一次 `initialize_renderer`；每帧调用 `render_frame`，由它选择当前 way 的广告位、完成一次共享准备并交给执行器。业务不必手动拼接 `paste_args`：
+
+```python
+from paste_renderer import initialize_renderer, render_frame, release_renderer
+
+executor = initialize_renderer(owner, existing_options)
+try:
+    output = render_frame(
+        owner, frame_input, data_dict, frame_id,
+        mask_canvas=mask_canvas, material_groups=current_groups,
+        camera_history=camera_history, device=device,
+    )
+finally:
+    release_renderer(owner)
+```
+
+示例变量来自业务现有数据；连续直播应将初始化放到循环外、`render_frame` 放到循环内，完整有界历史/输出示例见 [RENDER_API_REVIEW.md](RENDER_API_REVIEW.md)。`material_groups` / `camera_history` 省略或为 `None` 时使用 owner 已有字段；显式空素材组拒绝，B=0 由调度方跳过。无广告时跳过共享相机/核准备。
+
+`RenderOptions` 是规范配置类，`RenderExecutor` 承接输入准备、缓存、后端执行和 NumPy 导出。旧 `AdapterOptions` / `PasteBatchAdapter` 分别是同一个类的兼容别名；旧函数、`setup_shared_paste`、`prepare_shared_paste_args` 和动态示例函数继续可用。新旧入口使用 owner 上同一组 builder/执行器对象，不产生第二套缓存。
 
 原始会话未提供 `motion_rate_to_sigma`、`create_gaussian_kernel`、`compute_camera_motion_rate` 的生产实现；基准中的实现是合成回调。接入时沿用业务原方法，再用真实视频、参数和负载验收。
 
-`AdapterOptions.batch_chunk_size` 默认 `"auto"`：仅匹配已测硬件和输入结构时应用离线策略，未知情况回退整批。`0` 强制原整批，正整数强制指定分块上限。`last_execution` 可查看实际选择和回退原因。NumPy保持独立存储，返回即可读取；内部复制流不改变调用方串行调用约定。自动策略不强行启用可分离模糊，仍需真实核验证。
+`RenderOptions.batch_chunk_size` 默认 `"auto"`：仅匹配已测硬件和输入结构时应用离线策略，未知情况回退整批。`0` 强制原整批，正整数强制指定分块上限。执行器的 `last_execution` 可查看实际选择和回退原因。NumPy保持独立存储，返回即可读取；内部复制流不改变调用方串行调用约定。自动策略不强行启用可分离模糊，仍需真实核验证。
 
-既有分块准入仍限定在 B8/B16、4 或 16 个广告位、已测素材尺寸循环和 108×320 ROI 等完整条件内，并保留现有硬件/软件门槛。精确准入表见 [paste_execution_policy.py](paste_execution_policy.py)；本轮未改动该表，也不自动启用 bucketed。不要据此推广到 32 个广告位或任意输入结构。
+此前扩展的分块档位仍限定在 B8/B16、4 或 16 个广告位、已测素材尺寸循环和 108×320 ROI 等完整条件内，并保留现有硬件/软件门槛及更早的已测档位。精确准入表见 [paste_execution_policy.py](paste_execution_policy.py)；本轮未改动该表，也不自动启用 bucketed。不要据此推广到 32 个广告位或任意输入结构。
 
 默认 `normalization="legacy"`、`camera_index_policy="legacy"` 保留原行为；`matched` / `corrected` 是需要单独验收的语义修正。保持 B1 输出 `[H,W,3]`、多组输出 `[B,H,W,3]` 的 NumPy `uint8` 协议；K、畸变系数和单应矩阵须实时读取。GPU worker 初始化及预热后复用 builder / adapter，素材变更按既有接口使缓存失效。
 
 独立 NumPy 输出由其底层 PyTorch Tensor 持有存储；调用方不再引用后，存储才可由分配器回收复用。释放 builder/adapter 不会覆盖调用方仍持有的输出，也不会清空全局分配器。CUDA `reserved` 或进程工作集暂时不下降，不能单独作为泄漏证据；同样不能仅据一个稳定快照宣称没有泄漏。
 
-原包文档中的“本地没有 CUDA GPU”描述的是打包时的环境。初次部署的 GPU 校验见 [VALIDATION.md](VALIDATION.md)，本轮结果状态见 [直播运行报告](STREAMING_REVIEW.md)；合成基准通过不等于完成生产视频验收。
+原包文档中的“本地没有 CUDA GPU”描述的是打包时的环境。初次部署的 GPU 校验见 [VALIDATION.md](VALIDATION.md)，本轮接口迁移验收状态见 [RENDER_API_REVIEW.md](RENDER_API_REVIEW.md)；合成基准通过不等于完成生产视频验收。

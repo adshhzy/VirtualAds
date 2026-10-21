@@ -620,7 +620,7 @@ def check_shared_geometry(cli, device):
 
 def check_exception_recovery(cli, device):
     """A failed later chunk must finish pending copies and leave the adapter usable."""
-    import paste_gpu_batch_adapter as adapter_module
+    import paste_render_executor as adapter_module
 
     call = case_inputs(device, 5, 1, "dense_per_member")
     whole_options = options(cli, batch_chunk_size=0)

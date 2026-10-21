@@ -2,19 +2,25 @@
 
 ## 项目与运行
 
-- VirtualAds 是 Python GPU 库和命令行基准，没有 Web 服务。当前版本 `2026-10-21-perf4.5-streaming`。原包 perf4.1 基线为 `0b97beb`；最初 perf4 为 `480fad5`。本轮整理直播缓存上限、重复准备和资源生命周期，未改 batch 默认或 auto 表；实现与验收状态见 `STREAMING_REVIEW.md`。
+- VirtualAds 是 Python GPU 库和命令行基准，没有 Web 服务。当前版本 `2026-10-21-perf4.6-render-api`，本轮对照基线 `4b2b311`。原包 perf4.1 基线为 `0b97beb`；最初 perf4 为 `480fad5`。本轮统一业务入口与执行器职责，不改 GPU 数学、batch 默认或 auto 表，也不宣称性能提升；接口与验收状态见 `RENDER_API_REVIEW.md`。
 - 先尊重调用方的 `PASTE_GPU_PYTHON`；未设置时使用 `scripts/run.ps1` 的默认解释器，即仓库父目录下 `env\paste_gpu_performance\Scripts\python.exe`。不要在新机器上硬编码旧 E 盘路径；不要直接用系统 Python 运行项目，也不要改动其他项目环境。若环境不存在，按 README 创建。
 - 当前 Windows 锁文件要求现有 Python 3.12 与 uv。`scripts/setup.ps1 -PythonPath ... -UvPath ...` 创建项目环境并安装 `requirements-lock.txt`，不会下载/安装 Python 或 uv；torch 独立使用官方 cu128 源。自定义 `-EnvironmentPath` 后相应设置 `PASTE_GPU_PYTHON`。依赖调整应同步锁文件并验证 CUDA / Triton 兼容。
 - 本机已测参考：Windows、RTX 4090、Python 3.12.14、PyTorch 2.9.1+cu128；当时解释器为 `E:\dev\virtualAds\env\paste_gpu_performance\Scripts\python.exe`。此路径是历史记录，不是所有克隆的固定入口。
 - `scripts/run.ps1 shared ...` 对应 `benchmark_shared_paste.py`；`scripts/run.ps1 batch ...` 对应 `benchmark_paste_gpu_batch.py`。
 - `scripts/run.ps1 backends ...` 对应 `benchmark_backend_comparison.py`；`before_bucketed` 候选配合 `--baseline` 在同进程隔离比较旧桶、当前桶和 batch，`--require-exact` 指定必须零差异的候选。`check-backends` 对应 `check_backend_contracts.py`；`check-policy` 对应 CPU 元数据测试 `test_backend_policy.py`。旧 batch 源码对照仍用 `compare` / `benchmark_dynamic_comparison.py`，`--slots` 为单个正整数，默认 16。
 - `scripts/run.ps1 check-streaming` 对应 `check_streaming_stability.py`，需要 `--baseline` 指向保留源码；`--frames` 是固定/动态两阶段合计测量帧数，不含预热。新克隆先按 README 的 `git archive`/`Expand-Archive` 步骤恢复 `6edf109`；旧桶基线为 `9c6e930`。禁止为恢复基线覆盖或删除已有 results。运行示例与内存指标边界见 `STREAMING_REVIEW.md`。
-- `shared_paste_example.py` 展示业务接入；`paste_gpu_batch_adapter.py` 负责接口、素材缓存和输出，`paste_gpu_batch.py` 负责核心路由。共享参数逻辑位于 `paste_shared_params.py` / `paste_camera_filter.py`，GPU 内核在 `paste_*_kernels.py`。
-- `paste_asset_cache.py` 负责历史素材 stack 的预算/LRU/revision；当前素材与源身份引用由 adapter 持有。优先阅读 `README.md`、`ARCHITECTURE.md` 和 `STREAMING_REVIEW.md`；`BUCKETED_OPTIMIZATION_REVIEW.md`、`BACKEND_COMPARISON_REVIEW.md` 等为历史记录，不能据旧文档扩大当前策略范围。results/logs/env/缓存不随 Git 分发；报告中的原始测试 artifact 不在新克隆内，恢复源码不能恢复旧测量数据。
+- 新业务入口为 `paste_renderer.initialize_renderer` / `render_frame` / `release_renderer`；`paste_render_executor.py` 的 `RenderOptions` / `RenderExecutor` 是规范实现。`paste_gpu_batch_adapter.py` 只保留旧导入/函数兼容，勿再复制一份执行逻辑。共享参数在 `paste_shared_params.py` / `paste_camera_filter.py`，纯 Tensor 路由在 `paste_gpu_batch.py`，GPU 内核在 `paste_*_kernels.py`。
+- `paste_asset_cache.py` 负责历史素材 stack 的预算/LRU/revision；当前素材与源身份引用由执行器持有。优先阅读 `README.md`、`ARCHITECTURE.md` 和 `RENDER_API_REVIEW.md`；`STREAMING_REVIEW.md`、`BUCKETED_OPTIMIZATION_REVIEW.md` 等为历史记录，不能重写旧结果或据旧文档扩大当前策略范围。results/logs/env/缓存不随 Git 分发；报告中的原始测试 artifact 不在新克隆内，恢复源码不能恢复旧测量数据。
 - 新克隆用已有 uv 执行 `uv.exe tool run --from ruff==0.14.1 ruff format --check .` 和 `uv.exe tool run --from ruff==0.14.1 ruff check .`。`scripts/lint.ps1` 仅适用于已有 `..\env\tools\bin\uv.exe` 的工作区，不读取 setup 的 `-UvPath`；`-Fix` 仅统一格式再检查。Ruff 0.14.1/100列/LF/Python3.9语法目标，配置在 `pyproject.toml`，工具隔离于GPU环境。保留平铺导入路径；优先按阶段职责放置 helper，不引入只为包装参数的层层对象。
 
 ## 必须保持的行为
 
+- `AdapterOptions is RenderOptions`、`PasteBatchAdapter is RenderExecutor`：旧名称必须保持同一个 class，不能改成子类或额外包装实例。旧函数、`__call__`、共享准备和动态示例函数签名/返回值继续兼容；新业务用 `render_frame`，已有手工准备流程仍可运行。
+- 统一入口应调用 `executor(...)`，标准类再转调 `render_prepared`；不得直接绕过旧业务子类的 `__call__` 覆盖。
+- 旧 adapter 模块是兼容 shim，helper 属性读取可代理，但给旧模块私有全局赋值不会转发。需注入测试依赖时定位实际实现模块 `paste_render_executor`，不要另复制执行代码或把私有 monkeypatch 当作业务 API。
+- owner 的 `_paste_batch_adapter` / `_shared_paste_builder` 是唯一执行器/builder 存储位，不能另增一套缓存。每帧共享准备一次，ROI 网格仍待实际素材尺寸明确后通过 builder 回调产生。无广告绕过共享准备；`ad_params_{way_id}` 的非 None 值优先。
+- 新 `render_frame` 的 `material_groups=None` / `camera_history=None` 意味着沿用 owner 已有字段；显式空组拒绝。旧动态 wrapper 的必要参数和显式 None 行为继续兼容，不可顺手改成新 API 的默认语义。
+- 初始化在 worker 内调用一次；退出用 `release_renderer(owner)`，释放后原实例仍可重用。真实业务回调、独立 NumPy、调用方历史及有界输出队列的所有权保持不变。
 - 默认保持 `normalization="legacy"`、`camera_index_policy="legacy"`；性能修改不要同时混入 `matched` / `corrected` 的画面行为变更。
 - 默认 NumPy `uint8`：B1 为 HWC、多组为 BHWC；显式 `squeeze_single=False` 保留 B1 维。固定页输出必须独立，不得被下一帧覆盖。
 - K、畸变系数、单应矩阵可能原地更新；不能仅按 frame_id 缓存几何结果。尺寸按实际素材 / 显式 resize 后的高宽处理。
@@ -54,10 +60,13 @@ $workspaceRoot = Split-Path -Parent (Get-Location).Path
 $pythonCandidate = if ($env:PASTE_GPU_PYTHON) { $env:PASTE_GPU_PYTHON } else { Join-Path $workspaceRoot 'env\paste_gpu_performance\Scripts\python.exe' }
 $projectPython = (Resolve-Path -LiteralPath $pythonCandidate -ErrorAction Stop).Path
 & $projectPython -m unittest test_streaming_history test_streaming_lifecycle test_adapter_preparation test_core_guards test_backend_policy
-.\scripts\run.ps1 check-streaming --device cuda:0 --baseline results/baseline_streaming_6edf109 --frames 10000 --warmup 200 --sample-every 100 --check-every 250 --revision-every 1 --retain-outputs 3 --output results/streaming_10000.json
+& $projectPython -B -m unittest test_render_api
+.\scripts\run.ps1 check-streaming --device cuda:0 --entry-point render_frame --baseline results/baseline_render_api_4b2b311 --baseline-label 4b2b311 --frames 10000 --warmup 200 --sample-every 100 --check-every 250 --revision-every 1 --retain-outputs 3 --output results/render_api_streaming_final_10000.json
 ```
 
 上述命令在仓库根目录执行；基线须先恢复，`--output` 应改为未占用的新结果文件名。不能把 README 的示例路径或旧报告中的本机路径当作当前环境事实。
+
+接口组织改动还须针对 `4b2b311` 的隔离旧源码对照完整调用：新 `render_frame` 与旧共享准备+adapter 输出逐字节一致，`last_execution` 决策一致；覆盖动态 B、同帧原地更新、revision/成员变化、无广告与 way 优先、释放重用和旧输出存活。`compare` / `check-streaming --entry-point render_frame` 只切换当前路径，旧 baseline/oracle 必须继续使用隔离旧实现；默认 `legacy` 路线不变。CPU mock/别名测试不能代替 GPU 图像对照，`test_render_api` 的额外 GPU 项需显式设 `PASTE_TEST_DEVICE=cuda:0`。具体执行记录见 `RENDER_API_REVIEW.md`。本轮不以类/函数迁移推断性能收益。
 
 持续运行报告要区分库 retained stack、当前工作集、源输入、业务输出、CUDA allocated/reserved 以及固定页分配器保留量；记录预热后趋势、释放前后和重用后的状态。只对实际检查帧声称逐字节一致，有限帧合成测试不能证明生产直播永不泄漏。共享 GPU 的基准与长测必须串行，避免相互污染。
 

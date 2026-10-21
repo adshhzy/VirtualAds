@@ -1,4 +1,7 @@
-"""Business integration example for changing the number of material groups.
+"""Compatibility entry points for changing the number of material groups.
+
+New integrations use paste_renderer.render_frame directly. These wrappers keep
+the old signatures and initialization return value for existing business code.
 
 The caller supplies its existing owner and real camera/motion/Gaussian callbacks.
 Use a separate owner per worker and call it serially on one CUDA compute stream.
@@ -10,11 +13,15 @@ each real camera record before rendering, and explicitly resets it on a seek.
 from dataclasses import replace
 
 if __package__:
+    from .paste_renderer import render_frame
     from .shared_paste_example import BoundedCameraHistory as BoundedCameraHistory
-    from .shared_paste_example import prepare_shared_paste_args, setup_shared_paste
+    from .shared_paste_example import prepare_shared_paste_args as prepare_shared_paste_args
+    from .shared_paste_example import setup_shared_paste
 else:
+    from paste_renderer import render_frame
     from shared_paste_example import BoundedCameraHistory as BoundedCameraHistory
-    from shared_paste_example import prepare_shared_paste_args, setup_shared_paste
+    from shared_paste_example import prepare_shared_paste_args as prepare_shared_paste_args
+    from shared_paste_example import setup_shared_paste
 
 
 def initialize_dynamic_worker(owner, base_options, *, use_separable=False, max_cached_sizes=3):
@@ -84,20 +91,17 @@ def render_dynamic_frame(
 
     owner.imgs_raw_groups = material_groups
     owner.paste_data_stack = camera_history
-    adapter = owner._paste_batch_adapter
-    parameters = data_dict.get(f"ad_params_{way_id}")
-    if parameters is None:
-        parameters = data_dict.get("ad_params")
-    if not isinstance(parameters, (list, tuple)) or not parameters:
-        # No ads need no camera/kernel data. Invalid parameter types also go
-        # directly to the adapter, preserving its ordinary validation error.
-        return adapter(owner, frame_input, data_dict, frame_id, way_id, None)
-
-    # One shared preparation for the entire B, never one call per group/chunk.
-    paste_args = prepare_shared_paste_args(
-        owner, frame_input, data_dict, frame_id, mask_canvas, device=device
+    # Assign history even when it is None, preserving this legacy API's behavior.
+    # New render_frame callers may omit groups/history to reuse the owner's state.
+    return render_frame(
+        owner,
+        frame_input,
+        data_dict,
+        frame_id,
+        mask_canvas=mask_canvas,
+        device=device,
+        way_id=way_id,
     )
-    return adapter(owner, frame_input, data_dict, frame_id, way_id, paste_args)
 
 
 # Worker setup, once:
@@ -108,5 +112,5 @@ def render_dynamic_frame(
 #                      "dist_coeffs": current_cpu_coefficients}
 # output = render_dynamic_frame(..., camera_history=history, ...)
 # On shutdown, after the last render returns:
-# builder.release_resources()
+# paste_renderer.release_renderer(owner)
 # history.clear()

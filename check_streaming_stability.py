@@ -5,6 +5,7 @@ phases. The same current builder/adapter survives both phases. Periodic old-code
 oracles clear their assets/kernel cache before memory sampling. Neither the live
 loop nor sampling calls gc.collect() or empty_cache(). Allocator reserved bytes
 are reported separately from live allocations and are not classified as leaks.
+--entry-point selects the current path only; the isolated oracle stays legacy.
 """
 
 from __future__ import annotations
@@ -30,6 +31,12 @@ def parse_arguments():
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--device", default="cuda:0")
+    parser.add_argument(
+        "--entry-point",
+        choices=("legacy", "render_frame"),
+        default="legacy",
+        help="current implementation entry point; oracle keeps explicit preparation",
+    )
     parser.add_argument("--baseline", type=Path, required=True)
     parser.add_argument("--baseline-label", default="6edf109")
     parser.add_argument("--frames", type=int, default=5000)
@@ -325,6 +332,8 @@ class StreamCase:
             optimized=True,
             separable=True,
         )
+        if cli.entry_point == "render_frame":
+            self.current.enable_public_api()
         self.oracle = RenderPath(
             "baseline",
             SyntheticFixture(

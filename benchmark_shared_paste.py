@@ -37,7 +37,7 @@ from pathlib import Path
 import sys
 import time
 
-BENCHMARK_VERSION = "2026-10-21-perf4.5-streaming"
+BENCHMARK_VERSION = "2026-10-21-perf4.6-render-api"
 GRID_ATOL = 2e-6
 
 
@@ -256,6 +256,23 @@ class RenderPath:
             warp_grids_builder=self.builder.build_warp_grids if optimized else None,
         )
         self.adapter = PasteBatchAdapter(options)
+        self._public_render_frame = None
+
+    def enable_public_api(self):
+        """Use render_frame with this path's existing optimized worker state.
+
+        Enable after selecting the final builder and adapter. Binding the same
+        instances also keeps later adapter.options replacements visible here.
+        Reference paths retain their explicit preparation implementation.
+        """
+        if not self.optimized:
+            raise ValueError("the public entry point requires optimized shared preparation")
+        from paste_renderer import render_frame
+
+        owner = self.fixture.owner
+        owner._shared_paste_builder = self.builder
+        owner._paste_batch_adapter = self.adapter
+        self._public_render_frame = render_frame
 
     def prepare(self, include_warps=False):
         import torch
@@ -320,6 +337,17 @@ class RenderPath:
 
     def render(self):
         fixture = self.fixture
+        if self._public_render_frame is not None:
+            # render_frame owns shared preparation; do not also call prepare().
+            return self._public_render_frame(
+                fixture.owner,
+                fixture.frame,
+                fixture.data,
+                fixture.frame_id,
+                mask_canvas=fixture.image_args[5],
+                device=fixture.device,
+                way_id=fixture.way_id,
+            )
         return self.adapter(
             fixture.owner,
             fixture.frame,
