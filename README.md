@@ -1,8 +1,10 @@
-# GPU 广告贴图 perf4
+# GPU 广告贴图 perf4.1
 
-这是 PyTorch / Triton GPU 贴图库和命令行基准程序，没有 Web 服务或浏览器界面。版本为 `2026-10-20-perf4`，已部署到 `E:\dev\virtualAds\paste_gpu_performance`，后续可直接在 Codex 中打开此目录迭代。
+这是 PyTorch / Triton GPU 贴图库和命令行基准程序，没有 Web 服务或浏览器界面。当前版本为 `2026-10-21-perf4.1`，已部署到 `E:\dev\virtualAds\paste_gpu_performance`，后续可直接在 Codex 中打开此目录迭代。
 
-来源：[原分享会话](https://chatgpt.com/share/6ad7de37-4b64-83ec-9ac2-1ad7013e17b5) 的 `paste_gpu_performance_perf4.zip`。压缩包 SHA256 为 `17c6354f8c478a74daa52cc6f0294a21fb71fc1eb22b2e811b8e6d1130b6a26b`；Git 原始代码基线为 `480fad5`。原包的说明保留在 [SHARED_PIPELINE_README.md](SHARED_PIPELINE_README.md) 和 [paste_gpu_performance_README.txt](paste_gpu_performance_README.txt)。
+当前代码来自[最新分享会话](https://chatgpt.com/share/6ad82a9c-6d28-83ec-a454-ff17371706f4)的 `paste_gpu_performance_perf4_1.zip`，SHA256 为 `c1fbb5865f284d13b57cff251c6e11130add09b7af8f76e60fc3feae1c28a43a`，13 个原包文件已逐字节校验。perf4.1 增加 Python 3.9 延迟注解修复与运行环境日志，GPU 算法、缓存和输出协议不变。更新记录及后续方向见 [PERF4_1_REVIEW.md](PERF4_1_REVIEW.md)。
+
+最初 perf4 来自[原分享会话](https://chatgpt.com/share/6ad7de37-4b64-83ec-9ac2-1ad7013e17b5)，归档 SHA256 为 `17c6354f8c478a74daa52cc6f0294a21fb71fc1eb22b2e811b8e6d1130b6a26b`；Git 原始代码基线为 `480fad5`。原包的说明保留在 [SHARED_PIPELINE_README.md](SHARED_PIPELINE_README.md) 和 [paste_gpu_performance_README.txt](paste_gpu_performance_README.txt)。
 
 ## 环境与启动
 
@@ -37,6 +39,8 @@ $env:PASTE_GPU_PYTHON = 'D:\venvs\paste_gpu\Scripts\python.exe'
 .\scripts\run.ps1 shared --device cuda:0 --batch 8 --slots 16 --ad-sizes 200x200 500x500 --diagnose
 .\scripts\run.ps1 shared --device cuda:0 --batch 8 --slots 16 --ad-sizes 200x200 500x500 300x600 --diagnose
 ```
+
+需要同轮比较完整 eager 基线时，追加 `--include-eager`。不要把不同运行、不同机器或不同计时范围的节省量相加。
 
 把 `--diagnose` 换为 `--check-only` 可只检查正确性。`--sigma-pattern repeated` 可另外检查精确 sigma 缓存复用。原核心 / adapter 基准不包含共享参数构造成本：
 

@@ -26,6 +26,8 @@ False 会改变透明边缘的结果，应按需求显式启用。
 原 paste_gpu_batch 保留用于低显存和端到端性能对比。见 BUCKET_EXAMPLE。
 """
 
+from __future__ import annotations
+
 from array import array
 from functools import lru_cache, partial
 from typing import Callable, Sequence

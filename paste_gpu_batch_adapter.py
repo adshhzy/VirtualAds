@@ -103,7 +103,7 @@ else:
         paste_gpu_bucketed, validate_inputs,
     )
 
-ADAPTER_VERSION = "2026-10-20-perf4"
+ADAPTER_VERSION = "2026-10-21-perf4.1"
 
 
 @dataclass(frozen=True)

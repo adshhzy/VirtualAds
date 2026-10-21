@@ -2,12 +2,12 @@
 
 ## 项目与运行
 
-- 这是 Python GPU 库和命令行基准，没有 Web 服务。原包版本 `2026-10-20-perf4`；原始提交 `480fad5` 便于比较修改。
+- 这是 Python GPU 库和命令行基准，没有 Web 服务。当前原包版本 `2026-10-21-perf4.1`；最初 perf4 提交 `480fad5` 便于比较修改。perf4.1 仅修复延迟注解、更新版本与环境日志，未改变 GPU 算法。
 - 默认解释器：`E:\dev\virtualAds\env\paste_gpu_performance\Scripts\python.exe`。不要直接用系统 Python，也不要修改其他项目的环境。
 - 使用 `scripts/setup.ps1` 从 `requirements-lock.txt` 安装依赖；torch 独立使用官方 cu128 源。依赖调整应同步锁文件并验证 CUDA / Triton 兼容。
 - `scripts/run.ps1 shared ...` 对应 `benchmark_shared_paste.py`；`scripts/run.ps1 batch ...` 对应 `benchmark_paste_gpu_batch.py`。
 - `shared_paste_example.py` 展示业务接入；`paste_gpu_batch_adapter.py` 负责接口、素材缓存和输出，`paste_gpu_batch.py` 负责核心路由。共享参数逻辑位于 `paste_shared_params.py` / `paste_camera_filter.py`，GPU 内核在 `paste_*_kernels.py`。
-- 优先阅读 `README.md`、`SHARED_PIPELINE_README.md` 和 `paste_gpu_performance_README.txt`。日志、输出和缓存不提交 Git。
+- 优先阅读 `README.md`、`PERF4_1_REVIEW.md`、`SHARED_PIPELINE_README.md` 和 `paste_gpu_performance_README.txt`。日志、输出和缓存不提交 Git。
 
 ## 必须保持的行为
 

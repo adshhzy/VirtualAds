@@ -34,10 +34,11 @@ from dataclasses import replace
 import json
 import math
 from pathlib import Path
+import sys
 import time
 from types import SimpleNamespace
 
-BENCHMARK_VERSION = "2026-10-20-perf4"
+BENCHMARK_VERSION = "2026-10-21-perf4.1"
 GRID_ATOL = 2e-6
 
 
@@ -381,6 +382,7 @@ def main():
     if ADAPTER_VERSION != BENCHMARK_VERSION:
         parser.error(f"requires adapter {BENCHMARK_VERSION}; loaded {ADAPTER_VERSION}; extract the complete matching bundle")
     print(json.dumps({"benchmark_version": BENCHMARK_VERSION, "benchmark_path": str(Path(__file__).resolve()),
+        "python": sys.version, "python_executable": sys.executable,
         "torch": torch.__version__, "cuda": torch.version.cuda, "scipy": scipy.__version__,
         "gpu": torch.cuda.get_device_name(device), "arguments": vars(cli),
         "fixture": "synthetic motion/gaussian; shared preparation once per frame; GPU image pixels; live CPU calibration"}, indent=2))

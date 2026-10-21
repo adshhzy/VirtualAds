@@ -1,4 +1,8 @@
-paste_gpu_batch 完整优化包 — 2026-10-20-perf4
+paste_gpu_batch 完整优化包 — 2026-10-21-perf4.1
+
+perf4.1 修复 Python 3.9 导入时 tuple[...] | None 类型注解求值错误。
+paste_gpu_batch.py 补充延迟注解，两个 benchmark 打印 Python 版本和解释器路径。
+GPU 算法、缓存及输出不变；整包版本统一更新，不需要为本问题升级运行环境。
 
 本版保留 perf3 密集模糊融合与多尺寸缓存，新增共享参数构造优化。
 接入步骤和兼容性说明见 SHARED_PIPELINE_README.md，示例为 shared_paste_example.py。
@@ -24,7 +28,7 @@ paste_gpu_batch 完整优化包 — 2026-10-20-perf4
   不要用开发检查环境的 PyTorch/Triton 版本覆盖生产环境。
   python benchmark_shared_paste.py --version
   python benchmark_paste_gpu_batch.py --version
-  两个 benchmark 和 adapter 都应为 2026-10-20-perf4。
+  两个 benchmark 和 adapter 都应为 2026-10-21-perf4.1。
   --version / --help 无需GPU；正式CLI测速要求CUDA。
 
 新增共享构造整体测试

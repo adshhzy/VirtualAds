@@ -27,11 +27,12 @@ import json
 import math
 from pathlib import Path
 import statistics
+import sys
 import time
 from types import SimpleNamespace
 
-BENCHMARK_VERSION = "2026-10-20-perf4"
-DIAGNOSTIC_ADAPTER_VERSION = "2026-10-20-perf4"
+BENCHMARK_VERSION = "2026-10-21-perf4.1"
+DIAGNOSTIC_ADAPTER_VERSION = "2026-10-21-perf4.1"
 
 
 def parse_ad_size(value):
@@ -747,6 +748,7 @@ def main():
     torch.cuda.set_device(device)
     print(json.dumps({"benchmark_version": BENCHMARK_VERSION,
                       "benchmark_path": str(Path(__file__).resolve()),
+                      "python": sys.version, "python_executable": sys.executable,
                       "adapter_version": adapter_version,
                       "adapter_path": str(Path(adapter_module.__file__).resolve()),
                       "torch": torch.__version__, "cuda": torch.version.cuda,

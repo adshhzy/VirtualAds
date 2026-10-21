@@ -1,4 +1,6 @@
-# perf4：共享参数构造与批量贴图整体优化
+# perf4.1：共享参数构造与批量贴图整体优化
+
+2026-10-21 兼容性修复：`paste_gpu_batch.py` 补充 `from __future__ import annotations`，避免 Python 3.9 在导入时求值 `tuple[...] | None` 报错。两个 benchmark 新增 Python 版本和解释器路径输出。未修改 GPU 算法、缓存策略或输出格式；不需要为此升级 Python/CUDA。版本标记统一为 `2026-10-21-perf4.1`。
 
 本版把每帧的相机滤波、畸变网格、广告位透视网格、模糊核准备和最终 NumPy 输出一起纳入对照。旧对照同样每帧只构造一次共享参数，没有人为按 batch 重复计算。
 
@@ -89,7 +91,7 @@ python benchmark_shared_paste.py --device cuda:0 --batch 8 --slots 16 --ad-sizes
 python benchmark_shared_paste.py --device cuda:0 --batch 8 --slots 16 --ad-sizes 200x200 500x500 300x600 --diagnose
 ```
 
-版本应为 `2026-10-20-perf4`。默认同轮比较以下三条完整路径，均包含独立的固定页 NumPy 输出：
+版本应为 `2026-10-21-perf4.1`。默认同轮比较以下三条完整路径，均包含独立的固定页 NumPy 输出：
 
 | 字段 | 共享准备 | 贴图与模糊 |
 |---|---|---|
