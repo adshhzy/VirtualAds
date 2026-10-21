@@ -1,9 +1,9 @@
 # GPU 广告贴图库
 
-这是 PyTorch / Triton GPU 贴图库和命令行基准程序，没有 Web 服务或浏览器界面。当前本地版本为 `2026-10-21-perf4.3-backends`，位于 `E:\dev\virtualAds\paste_gpu_performance`。
+这是 PyTorch / Triton GPU 贴图库和命令行基准程序，没有 Web 服务或浏览器界面。当前本地版本为 `2026-10-21-perf4.4-bucketed`，位于 `E:\dev\virtualAds\paste_gpu_performance`。
 
-本轮补充 batch / bucketed 的完整流程对比、后端契约与自动策略回归，并按实测证据限定分块策略。
-先读 [代码阅读与修改指南](ARCHITECTURE.md)；最新测量、准入范围和验收见 [后端对比报告](BACKEND_COMPARISON_REVIEW.md)。默认后端继续使用 `batch`。
+本轮将桶素材打包缓存与 bbox 布局解耦，并让 Triton 桶采样复用 batch 的 warp/alpha 内核。
+先读 [代码阅读与修改指南](ARCHITECTURE.md)；最新测量与最终判断见 [桶优化报告](BUCKETED_OPTIMIZATION_REVIEW.md)。完整调用性能尚不足以支持自动切换到 bucketed，默认后端仍为 `batch`，既有分块策略表保持不变。
 
 [dynamic_paste_example.py](dynamic_paste_example.py) 展示业务 worker 初始化一次、每帧更新素材组/相机参数并返回原 NumPy 接口；沿用真实业务回调。
 
@@ -62,14 +62,14 @@ New-Item -ItemType Directory -Force results | Out-Null
 
 ## 后端对比与回归
 
-本轮覆盖 B=1/4/8/16、4/16/32 个广告位、1～3 种素材尺寸、静态/平移/缩放 bbox，共 108 个合成场景。
+本轮筛查覆盖 B=1/4/8/16、4/16/32 个广告位、1～3 种素材尺寸、静态/平移/缩放 bbox，共 108 个合成场景；所有场景已检查帧中的新 bucketed 与 batch 输出均逐字节一致。
 完整计时包含共享准备、素材缓存与打包、每帧 grid/透明度打包、布局/LUT 更新，以及完成 GPU 工作后的独立 NumPy 返回。
-`bucketed` 在其中 104 个场景有最大 1 级 uint8 差异，另外 4 个逐字节一致的场景更慢，未达到零差异和性能准入要求；不会自动替换 `batch`。
-动态 bbox 还会触发 bucket LUT 和当前桶素材重打包，不能用静态缓存结果推断其收益。
+动态 bbox/ROI 变化仍重建布局和 LUT；素材与有序桶成员不变时不再重新打包素材，`area_caps` 导致分组成员变化时重新打包。
+完整调用性能尚不足以支持自动切换，因此默认 `batch` 和既有分块表保持不变。完整证据见 [本轮报告](BUCKETED_OPTIMIZATION_REVIEW.md)；旧桶的历史观察保留在 [上一轮报告](BACKEND_COMPARISON_REVIEW.md)。
 
 | 命令 | 工具 | 用途 |
 |---|---|---|
-| `scripts/run.ps1 backends` | `benchmark_backend_comparison.py` | 比较整批、auto、手动 C4 与 bucketed；记录完整延迟、正确性和缓存/布局计数 |
+| `scripts/run.ps1 backends` | `benchmark_backend_comparison.py` | 比较 batch、当前桶和隔离加载的旧桶；记录完整延迟、正确性和缓存/布局计数 |
 | `scripts/run.ps1 check-backends` | `check_backend_contracts.py` | 检查后端覆盖顺序、广播、布局/素材更新和输出所有权 |
 | `scripts/run.ps1 check-policy` | `test_backend_policy.py` | CPU 元数据测试，检查策略精确准入与未知输入回退 |
 | `scripts/run.ps1 compare` | `benchmark_dynamic_comparison.py` | 隔离加载旧源码对照当前完整调用；`--slots` 指定广告位数，默认 16 |
@@ -80,8 +80,15 @@ New-Item -ItemType Directory -Force results | Out-Null
 .\scripts\run.ps1 check-policy
 ```
 
+同进程对照旧桶、当前桶与 batch，并要求当前桶对 batch 逐字节一致：
+
+```powershell
+.\scripts\run.ps1 backends --baseline results/baseline_bucketed_9c6e930 --candidates before_bucketed bucketed batch_whole --require-exact bucketed --batches 8 --slots 16 --profiles three --layouts static translate resize --rounds 3 --check-timed-steps
+```
+
+`--baseline` 指向保留源码目录，`before_bucketed` 使用其中独立加载的运行时；该目录不随 Git 提交。
 `backends` 默认检查第 0、1、7 帧；确认策略时使用 `--check-timed-steps` 覆盖实际计时帧，零差异门槛只对报告中的 `checked_steps` 成立。
-冷素材单次耗时、独立诊断与确认测量的使用方式见 [ARCHITECTURE.md](ARCHITECTURE.md) 和 [最新报告](BACKEND_COMPARISON_REVIEW.md)。
+`--require-exact` 指定的候选出现任何非零像素差即失败；旧桶可保留差异记录。冷素材单次耗时、独立诊断与确认测量的使用方式见 [ARCHITECTURE.md](ARCHITECTURE.md) 和 [最新报告](BUCKETED_OPTIMIZATION_REVIEW.md)。
 
 ## 接入与迭代约束
 
@@ -91,8 +98,8 @@ New-Item -ItemType Directory -Force results | Out-Null
 
 `AdapterOptions.batch_chunk_size` 默认 `"auto"`：仅匹配已测硬件和输入结构时应用离线策略，未知情况回退整批。`0` 强制原整批，正整数强制指定分块上限。`last_execution` 可查看实际选择和回退原因。NumPy保持独立存储，返回即可读取；内部复制流不改变调用方串行调用约定。自动策略不强行启用可分离模糊，仍需真实核验证。
 
-本轮新增准入限定在 B8/B16、4 或 16 个广告位、已测素材尺寸循环和 108×320 ROI 等完整条件内，并保留现有硬件/软件门槛。精确准入表见 [paste_execution_policy.py](paste_execution_policy.py) 和 [后端对比报告](BACKEND_COMPARISON_REVIEW.md)；不要据此推广到 32 个广告位或任意输入结构。
+上一版新增的分块准入仍限定在 B8/B16、4 或 16 个广告位、已测素材尺寸循环和 108×320 ROI 等完整条件内，并保留现有硬件/软件门槛。精确准入表见 [paste_execution_policy.py](paste_execution_policy.py)；本轮未改动该表，也不自动启用 bucketed，判断依据见 [本轮最终报告](BUCKETED_OPTIMIZATION_REVIEW.md)。不要据此推广到 32 个广告位或任意输入结构。
 
 默认 `normalization="legacy"`、`camera_index_policy="legacy"` 保留原行为；`matched` / `corrected` 是需要单独验收的语义修正。保持 B1 输出 `[H,W,3]`、多组输出 `[B,H,W,3]` 的 NumPy `uint8` 协议；K、畸变系数和单应矩阵须实时读取。GPU worker 初始化及预热后复用 builder / adapter，素材变更按既有接口使缓存失效。
 
-原包文档中的“本地没有 CUDA GPU”描述的是打包时的环境。初次部署的 GPU 校验见 [VALIDATION.md](VALIDATION.md)，本轮结果见 [后端对比报告](BACKEND_COMPARISON_REVIEW.md)；合成基准通过不等于完成生产视频验收。
+原包文档中的“本地没有 CUDA GPU”描述的是打包时的环境。初次部署的 GPU 校验见 [VALIDATION.md](VALIDATION.md)，本轮结果见 [桶优化报告](BUCKETED_OPTIMIZATION_REVIEW.md)；合成基准通过不等于完成生产视频验收。

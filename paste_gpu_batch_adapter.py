@@ -53,7 +53,8 @@ B>1时为[B,H,W,3]，每张图可通过results[b]取出。显式squeeze_single=F
   每个size最多max_entries_per_size=128个条目；每个条目是一广告位的[B,4,H,W]。
   切回同一素材对象与版本可命中；重新读取出一个新数组对象时会建立新条目。
 * cache_info()可查看各尺寸条目数及命中次数。invalidate_assets()清空全部尺寸。
-  backend='bucketed'的二次打包缓存仅保留当前布局一份，不影响上述素材尺寸缓存。
+  backend='bucketed'的二次打包缓存仅保留当前有序分桶素材一份；bbox变化而桶成员
+  不变时继续复用，不影响上述素材尺寸缓存。
 * 几何变化直接适配当前ROI，不要求固定size，不在此处自动torch.compile。
   Python字典、输入检查、CPU/GPU搬运均在图外；该适配器本身不适合capture。
 * backend='bucketed'可选；布局变化会重建CPU LUT，动态视频未必更快。
@@ -124,7 +125,7 @@ else:
         validate_inputs,
     )
 
-ADAPTER_VERSION = "2026-10-21-perf4.3-backends"
+ADAPTER_VERSION = "2026-10-21-perf4.4-bucketed"
 
 
 @dataclass(frozen=True)
@@ -656,8 +657,9 @@ class PasteBatchAdapter:
             ads_list.append(stacked)
 
         ads = tuple(ads_list)
-        # Bucket packing retains only the current layout. Size-based asset banks
-        # remain independent, so changing size need not invalidate all assets.
+        # Keep only the current packed asset set. A source-cache miss also
+        # invalidates it, preserving the source-reference lifetime guarantees.
+        # Geometry changes are handled separately in _prepare_bucket_inputs.
         if any_miss or not cache_enabled or key != self._asset_key:
             self._bucket_asset_key = None
             self._bucket_ads = None
@@ -1103,7 +1105,12 @@ class PasteBatchAdapter:
         return chunk_size, core_options
 
     def _prepare_bucket_inputs(self, args, boxes, batch, opt):
-        """Reuse packed assets only; pack current grids and opacity on every call."""
+        """Cache assets by their ordered bucket members, independently of ROI layout.
+
+        A layout change rebuilds the LUT and capacities. Packed source tensors
+        depend only on assets and ordered groups, so unchanged groups can reuse
+        them across bbox/ROI changes. Grids and opacity are always packed live.
+        """
         frames, ads, grids, distortion, kernel, mask, opacity = args
         hw = tuple(frames.shape[-2:])
         layout_key = (
@@ -1116,8 +1123,10 @@ class PasteBatchAdapter:
         if layout_key != self._layout_key:
             self._layout = make_bucket_layout(ads, boxes, hw, area_caps=opt.area_caps)
             self._layout_key = layout_key
-            self._bucket_asset_key = None
-        bucket_key = (layout_key, self._asset_key)
+        # _asset_key already covers revision, device, B, source identities,
+        # effective sizes and slot/member order. Capacities, offsets and bbox
+        # coordinates do not affect pack_bucket_ads; group membership does.
+        bucket_key = (self._asset_key, self._layout["groups"])
         if self._asset_key is None or bucket_key != self._bucket_asset_key:
             self._bucket_ads = pack_bucket_ads(ads, self._layout)
             self._bucket_asset_key = bucket_key

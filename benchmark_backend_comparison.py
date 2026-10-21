@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager
-from dataclasses import replace
+from dataclasses import fields, replace
 import fnmatch
 import gc
 import hashlib
@@ -32,6 +32,7 @@ CANDIDATES = {
     "batch_auto": ("batch", "auto"),
     "bucketed": ("bucketed", 0),
     "batch_c4": ("batch", 4),
+    "before_bucketed": ("bucketed", 0),
 }
 PROFILE_COUNTS = {"one": 1, "two": 2, "three": 3}
 CHECK_STEPS = (0, 1, 7)
@@ -60,6 +61,16 @@ def parse_arguments():
         default=["batch_whole", "batch_auto", "bucketed"],
     )
     parser.add_argument("--only-case", nargs="+", help="case ID glob(s), e.g. B8_S16_*_resize")
+    parser.add_argument(
+        "--baseline", type=Path, help="preserved source directory required for before_bucketed"
+    )
+    parser.add_argument(
+        "--require-exact",
+        choices=CANDIDATES,
+        nargs="+",
+        default=[],
+        help="fail on any nonzero pixel difference for these selected candidates",
+    )
     parser.add_argument("--height", type=int, default=1080)
     parser.add_argument("--width", type=int, default=1920)
     parser.add_argument("--kernel-size", type=int, default=9)
@@ -107,6 +118,10 @@ def parse_arguments():
         parser.error("each profile requires enough --ad-sizes entries")
     if len(set(options.candidates)) != len(options.candidates):
         parser.error("candidate names must not repeat")
+    if "before_bucketed" in options.candidates and options.baseline is None:
+        parser.error("before_bucketed requires --baseline")
+    if any(name not in options.candidates for name in options.require_exact):
+        parser.error("--require-exact names must be included in --candidates")
     if options.device == "cpu" and "batch_c4" in options.candidates:
         parser.error("manual batch_c4 requires CUDA; omit it for CPU fixture checks")
     return options
@@ -121,6 +136,7 @@ def source_provenance():
         directory / "benchmark_shared_paste.py",
         directory / "benchmark_paste_gpu_batch.py",
         directory / "benchmark_support.py",
+        directory / "benchmark_dynamic_comparison.py",
         *directory.glob("paste*.py"),
     }
     hashes = {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in sorted(sources)}
@@ -170,6 +186,20 @@ def triton_versions():
     return versions
 
 
+def baseline_source_provenance(directory):
+    """Identify the preserved runtime used by the isolated before candidate."""
+    sources = sorted(directory.glob("paste*.py"))
+    hashes = {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in sources}
+    return {
+        "directory": str(directory),
+        "scope": "preserved paste*.py runtime; fixture and timer use the current harness",
+        "sha256_by_file": hashes,
+        "combined_sha256": hashlib.sha256(
+            json.dumps(hashes, sort_keys=True).encode("utf-8")
+        ).hexdigest(),
+    }
+
+
 def synchronize(device):
     if device.type == "cuda":
         import torch
@@ -217,7 +247,7 @@ def create_fixture(options, device, image_args, boxes, layout):
 
 
 class CandidateState:
-    def __init__(self, name, fixture, blur_backend):
+    def __init__(self, name, fixture, blur_backend, baseline_modules=None):
         from benchmark_shared_paste import RenderPath
         from paste_gpu_batch_adapter import PasteBatchAdapter
 
@@ -233,6 +263,29 @@ class CandidateState:
                 profile_every=0,
             )
         )
+        if name == "before_bucketed":
+            baseline_adapter, baseline_shared = baseline_modules
+            cli = fixture.cli
+            self.path.builder = baseline_shared.SharedParameterBuilder(
+                acceleration=cli.acceleration,
+                normalization=cli.normalization,
+                distortion_inverse=not cli.forward,
+                iterations=cli.inverse_iterations,
+                camera_index_policy=cli.camera_index_policy,
+                distortion_align_corners=cli.align_corners,
+                enable_separable=blur_backend == "separable",
+            )
+            baseline_options = {
+                field.name: (
+                    self.path.builder.build_warp_grids
+                    if field.name == "warp_grids_builder"
+                    else getattr(self.path.adapter.options, field.name)
+                )
+                for field in fields(baseline_adapter.AdapterOptions)
+            }
+            self.path.adapter = baseline_adapter.PasteBatchAdapter(
+                baseline_adapter.AdapterOptions(**baseline_options)
+            )
         self.previous = None
         self.snapshot = None
 
@@ -312,10 +365,11 @@ def check_outputs(states, reference, options, batch, row):
             checks[name].append(
                 {"step": step, **difference, "execution": state.path.adapter.last_execution.copy()}
             )
-            if difference["max_abs_diff"] > 1:
+            allowed_difference = 0 if name in options.require_exact else 1
+            if difference["max_abs_diff"] > allowed_difference:
                 row["fatal_correctness_error"] = {"candidate": name, "step": step, **difference}
                 raise AssertionError(
-                    f"{name} step {step}: uint8 difference exceeds 1: {difference}"
+                    f"{name} step {step}: uint8 difference exceeds {allowed_difference}: {difference}"
                 )
         if not np.array_equal(reference.previous, frozen_expected):
             raise AssertionError("reference output changed while checking other candidates")
@@ -427,10 +481,8 @@ def cold_assets_call(state, options, device):
 
 
 @contextmanager
-def count_bucket_operations():
+def count_bucket_operations(module):
     """Benchmark-only wrappers: never installed during headline timing."""
-    import paste_gpu_batch_adapter as module
-
     names = (
         "make_bucket_layout",
         "pack_bucket_ads",
@@ -458,7 +510,7 @@ def diagnose_candidate(state, device):
     path, adapter = state.path, state.path.adapter
     adapter.options = replace(adapter.options, profile_every=1)
     samples = []
-    with count_bucket_operations() as counts:
+    with count_bucket_operations(sys.modules[type(adapter).__module__]) as counts:
         for step in (0, 0, 1, 7):
             path.fixture.set_frame(step)
             synchronize(device)
@@ -486,7 +538,7 @@ def diagnose_candidate(state, device):
     }
 
 
-def run_case(options, device, batch, slots, profile, layout, report):
+def run_case(options, device, batch, slots, profile, layout, report, baseline_modules=None):
     import torch
     from benchmark_paste_gpu_batch import make_case
 
@@ -524,7 +576,7 @@ def run_case(options, device, batch, slots, profile, layout, report):
 
     def state_for(name):
         fixture = create_fixture(fixture_options, device, image_args, boxes, layout)
-        return CandidateState(name, fixture, options.blur_backend)
+        return CandidateState(name, fixture, options.blur_backend, baseline_modules)
 
     states = {name: state_for(name) for name in options.candidates}
     reference = states.get("batch_whole") or state_for("batch_whole")
@@ -604,6 +656,13 @@ def main():
     options = parse_arguments()
     import torch
 
+    baseline_modules = None
+    if "before_bucketed" in options.candidates:
+        from benchmark_dynamic_comparison import load_baseline_modules
+
+        options.baseline = options.baseline.resolve()
+        baseline_modules = load_baseline_modules(options.baseline)
+
     device = torch.device(options.device)
     if device.type not in ("cuda", "cpu"):
         raise ValueError("only CUDA and CPU fixture checks are supported")
@@ -618,6 +677,9 @@ def main():
         "cuda": torch.version.cuda,
         "triton_versions": triton_versions(),
         "source_provenance": source_provenance(),
+        "baseline_source_provenance": baseline_source_provenance(options.baseline)
+        if baseline_modules is not None
+        else None,
         "device": str(device),
         "gpu": torch.cuda.get_device_name(device) if device.type == "cuda" else None,
         "arguments": serializable_arguments(options),
@@ -635,7 +697,9 @@ def main():
                             fnmatch.fnmatchcase(case_id, value) for value in options.only_case
                         ):
                             continue
-                        run_case(options, device, batch, slots, profile, layout, report)
+                        run_case(
+                            options, device, batch, slots, profile, layout, report, baseline_modules
+                        )
                         gc.collect()
                         if device.type == "cuda":
                             torch.cuda.empty_cache()

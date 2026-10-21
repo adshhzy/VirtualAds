@@ -536,7 +536,8 @@ def paste_gpu_bucketed(
 
     性能代价：各桶patch并存、维度重排/拼接、全画布gather和padding。
     不保证优于逐slot版本；把图外网格packing也纳入端到端基准。
-    acceleration 对最终融合/uint8/BHWC 输出启用 Triton；分桶采样不变。
+    acceleration 可用时，按 B*M 展平调用与 batch 相同的 Triton warp/alpha
+    数学，每桶一次启动；eager/reflection 保留 PyTorch 采样。最终融合仍按原路由。
     blur_backend='triton' 额外将模糊与最终融合合并，限制同 paste_gpu_batch。
     """
     _validate_blur_backend(blur_backend)
@@ -551,25 +552,39 @@ def paste_gpu_bucketed(
     ):
         raise ValueError("canvas_lut must be int64 [H,W] on frame device")
     batch = ads_buckets[0].shape[0]
+    accelerator = _select_accelerator(acceleration, frames)
     palette_parts = [frames.new_zeros((batch, 4, 1))]
     for source, grids, opacity in zip(ads_buckets, warp_grids_buckets, transparencies_buckets):
         _, members, _, src_h, src_w = source.shape
         length = grids.shape[2]
-        if not legacy_alpha:
-            source_alpha = source[:, :, 3:4] * (1.0 / 255.0)
-            source = torch.cat((source[:, :, :3] * source_alpha, source_alpha), dim=2)
-        warped = F.grid_sample(
-            source.reshape(batch * members, 4, src_h, src_w),
-            grids.reshape(batch * members, 1, length, 2),
-            mode="bilinear",
-            padding_mode=warp_padding_mode,
-            align_corners=warp_align_corners,
-        ).reshape(batch, members, 4, length)
-        if legacy_alpha:
-            alpha = warped[:, :, 3:4] * (1.0 / 255.0) * opacity
-            patch = torch.cat((warped[:, :, :3] * alpha, alpha), dim=2)
+        bucket_accelerator = None
+        if accelerator is not None and warp_padding_mode in ("zeros", "border"):
+            bucket_accelerator = _select_accelerator(acceleration, source, grids, opacity)
+        if bucket_accelerator is not None:
+            patch = bucket_accelerator.warp_bucket_patches(
+                source,
+                grids,
+                opacity,
+                align_corners=warp_align_corners,
+                padding_mode=warp_padding_mode,
+                legacy_alpha=legacy_alpha,
+            )
         else:
-            patch = warped * opacity
+            if not legacy_alpha:
+                source_alpha = source[:, :, 3:4] * (1.0 / 255.0)
+                source = torch.cat((source[:, :, :3] * source_alpha, source_alpha), dim=2)
+            warped = F.grid_sample(
+                source.reshape(batch * members, 4, src_h, src_w),
+                grids.reshape(batch * members, 1, length, 2),
+                mode="bilinear",
+                padding_mode=warp_padding_mode,
+                align_corners=warp_align_corners,
+            ).reshape(batch, members, 4, length)
+            if legacy_alpha:
+                alpha = warped[:, :, 3:4] * (1.0 / 255.0) * opacity
+                patch = torch.cat((warped[:, :, :3] * alpha, alpha), dim=2)
+            else:
+                patch = warped * opacity
         # 不能直接reshape(B,4,M*L)，必须先交换M/C维。
         palette_parts.append(patch.permute(0, 2, 1, 3).reshape(batch, 4, members * length))
 

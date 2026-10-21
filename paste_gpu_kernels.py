@@ -564,6 +564,46 @@ def warp_paste_into(
         )
 
 
+def warp_bucket_patches(
+    source,
+    grids,
+    opacity,
+    *,
+    align_corners=False,
+    padding_mode="zeros",
+    legacy_alpha=True,
+):
+    """Sample an entire bucket with exactly the batch path's FP32 arithmetic.
+
+    source is [B,M,4,src_h,src_w], grids is [B,M,L,2], and opacity
+    broadcasts to [B,M,1,L]. Fold B and M into the existing warp kernel's
+    batch axis and treat each flattened ROI as a 1-by-L image. One launch
+    produces [B,M,4,L] premultiplied patches, including transparent padding.
+    No per-slot launch or conversion through PyTorch grid_sample occurs.
+    """
+    batch, members, channels, src_h, src_w = source.shape
+    length = grids.shape[2]
+    if channels != 4 or grids.shape != (batch, members, length, 2):
+        raise ValueError("bucket source/grids must be [B,M,4,h,w] and [B,M,L,2]")
+    flattened_source = source.reshape(batch * members, 4, src_h, src_w)
+    flattened_grids = grids.reshape(batch * members, 1, length, 2)
+    flattened_opacity = opacity.expand(batch, members, 1, length).reshape(
+        batch * members, 1, 1, length
+    )
+    patches = source.new_empty((batch * members, 4, 1, length))
+    warp_paste_into(
+        flattened_source,
+        flattened_grids,
+        flattened_opacity,
+        patches,
+        (0, 0, length, 1),
+        align_corners=align_corners,
+        padding_mode=padding_mode,
+        legacy_alpha=legacy_alpha,
+    )
+    return patches.reshape(batch, members, 4, length)
+
+
 def blend_to_uint8(canvas, frames, mask, *, legacy_alpha=True):
     """Blend float32 [B,4,H,W] over frames and write independent uint8 BHWC.
 

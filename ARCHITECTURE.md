@@ -1,8 +1,8 @@
 # 代码阅读与修改指南
 
-当前版本 `2026-10-21-perf4.3-backends`。这是 GPU 贴图库和基准工具，不含视频解码、编码、推流或常驻服务。
+当前版本 `2026-10-21-perf4.4-bucketed`。这是 GPU 贴图库和基准工具，不含视频解码、编码、推流或常驻服务。
 这里的 **B（路数）是同一画面/布局下的素材组数**；每组产生一张结果，不等同于任意独立摄像机的并发数。
-最新后端测量、策略准入及验收见 [BACKEND_COMPARISON_REVIEW.md](BACKEND_COMPARISON_REVIEW.md)。
+最新测量、最终判断及验收见 [BUCKETED_OPTIMIZATION_REVIEW.md](BUCKETED_OPTIMIZATION_REVIEW.md)；[BACKEND_COMPARISON_REVIEW.md](BACKEND_COMPARISON_REVIEW.md) 保留上一轮旧桶观察。
 
 ## 先从哪里读
 
@@ -92,6 +92,10 @@ GPU 核心先按广告位顺序覆盖 RGBA 画布，再做全图畸变、模糊�
 因此矩形 ROI 先展平并补齐到 L，而非补齐成统一的最大高宽矩形。
 LUT 按原广告位顺序保留最后覆盖者；后位透明像素也会覆盖前位，而不是跳过覆盖。
 
+在可用的 Triton zeros/border 路径中，每桶将 B×M 作为批次，复用 batch 的同一 warp/alpha 内核，
+写出 `[B*M,4,1,L]` patch 后再组装 palette/LUT。eager 与 reflection 继续使用原 PyTorch 采样。
+这项复用统一采样算术；是否逐字节一致以及是否更快，仍须完整输出对照。
+
 这并未消除外围的逐广告位工作：素材检查/转换、布局规划，以及 grid/透明度的
 pad 和 stack 仍包含 slot 循环。当前 adapter 每帧重新打包 grid 和透明度；素材桶可复用缓存。
 两条核心路径最终都把 `[B,4,H,W]` 画布交给 `_finish_canvas`，完成相同的全图阶段。
@@ -127,15 +131,16 @@ Tensor 的 stride 和广播视图有实际性能意义，不要为了整洁随�
 
 - 素材缓存由尺寸、素材身份、版本、设备、B 等区分；原地修改素材后递增 `imgs_raw_version` 或显式失效。
 - 尺寸缓存保存各广告位已整理的 `[B,4,h,w]` 素材，`batch` 同样使用它；缓存命中不表示启用了 `bucketed` 计算分桶。
-- `bucketed` 另有当前布局的素材打包缓存。bbox 平移或改变 ROI 尺寸都会改变 adapter 的布局键，重建 `canvas_lut` 并重新打包当前素材桶；底层素材尺寸缓存仍可命中。不能把动态布局按静态 LUT 复用来估算耗时。
+- `bucketed` 只保留当前一份素材打包缓存，key 为素材 key 加有序桶成员。bbox、ROI 容量或 LUT 变化仍重建布局，但分组不变时复用打包素材；`area_caps` 导致成员分组变化时必须重打包。
+- 素材身份/版本、设备、B、源尺寸或顺序变化，以及显式失效、素材缓存 miss，仍使桶素材失效；禁用素材缓存时每帧重打包。grid/透明度始终实时打包，不复用旧几何。
 - Gaussian 核按精确 sigma 和回调/配置版本缓存；没有 sigma 量化。相同 `frame_id` 的 K、畸变、矩阵仍可能变化，因此不缓存整帧几何值。
 - 每次 NumPy 输出拥有独立存储。固定页路径直接返回 host Tensor 的 NumPy 视图，数组持有其底层 Tensor。
 - 分块路径仍在调用方计算流串行计算；内部复制流等对应事件后复制。GPU 源和 host 结果一直存活到复制完成，正常返回与异常退出都同步复制流。
 - 每个 worker 使用自己的实例，调用方按同一计算流串行调用。跨流生产输入需先建立依赖。
 
 `batch_chunk_size="auto"` 只匹配离线表；`0` 整批；正整数手动分块。默认后端仍为 `batch`，也不强行启用可分离模糊。
-本轮新增准入限定在 B8/B16、4/16 广告位、已测源尺寸循环、108×320 ROI 等条件内，继续检查既有硬件、软件和 Tensor 布局。
-精确准入表及回退条件以 [paste_execution_policy.py](paste_execution_policy.py) 和 [最新报告](BACKEND_COMPARISON_REVIEW.md) 为准，不能从广告位数或 B 单独推断；32 广告位不在此承诺内。
+当前策略表沿用上一版：新增分块档位限定在 B8/B16、4/16 广告位、已测源尺寸循环、108×320 ROI 等条件内，继续检查既有硬件、软件和 Tensor 布局。
+精确准入表及最终判断以 [paste_execution_policy.py](paste_execution_policy.py) 和 [最新报告](BUCKETED_OPTIMIZATION_REVIEW.md) 为准，不能从广告位数或 B 单独推断；32 广告位不在此承诺内。
 [动态路数报告](DYNAMIC_BATCH_REVIEW.md) 保留早期策略的历史测量。
 
 ## 基准与回归工具
@@ -143,7 +148,7 @@ Tensor 的 stride 和广播视图有实际性能意义，不要为了整洁随�
 | 命令 | 文件 | 验证范围 |
 |---|---|---|
 | `scripts/run.ps1 shared` | `benchmark_shared_paste.py` | 含共享准备与 NumPy 的完整调用 |
-| `scripts/run.ps1 backends` | `benchmark_backend_comparison.py` | 同输入、独立实例的 batch 整批/auto/手动分块与 bucketed 完整调用对比；含动态 bbox、打包和布局更新 |
+| `scripts/run.ps1 backends` | `benchmark_backend_comparison.py` | 同输入、独立实例的 batch 与当前/旧 bucketed 完整调用对比；含动态 bbox、打包和布局更新 |
 | `scripts/run.ps1 check-backends` | `check_backend_contracts.py` | 布局归属、透明覆盖、广播输入、动态几何/素材缓存及旧输出所有权对照 |
 | `scripts/run.ps1 check-policy` | `test_backend_policy.py` | CPU 元数据测试；验证自动策略完整结构匹配、未知输入回退及原有档位优先 |
 | `scripts/run.ps1 batch` | `benchmark_paste_gpu_batch.py` | 核心、adapter、dense 内核及诊断 |
@@ -155,9 +160,8 @@ Tensor 的 stride 和广播视图有实际性能意义，不要为了整洁随�
 `benchmark_support.py` 只共享报告、轮换顺序和同步计时；不放业务计算。
 基准使用合成运动/sigma/Gaussian 回调，不代表真实业务。不要把独立阶段计时相加，也不要把跨轮数字当收益。
 
-本轮完整筛查覆盖 B=1/4/8/16、4/16/32 广告位、1～3 种素材尺寸与静态/平移/缩放布局，共 108 个场景。
-其中 bucketed 有 104 个场景最大差 1 级 uint8，另外 4 个逐字节一致场景更慢，未满足零差异和性能准入，故默认继续采用 batch。
-详细数据、确认测量和限制见 [BACKEND_COMPARISON_REVIEW.md](BACKEND_COMPARISON_REVIEW.md)。
+上一轮旧 bucketed 的 108 场景筛查中，104 个场景最大差 1 级 uint8，另外 4 个逐字节一致场景更慢。
+该历史观察见 [BACKEND_COMPARISON_REVIEW.md](BACKEND_COMPARISON_REVIEW.md)，不能作为当前内核与缓存实现的结论；本轮结果见 [BUCKETED_OPTIMIZATION_REVIEW.md](BUCKETED_OPTIMIZATION_REVIEW.md)。
 
 `backends` 的计时从共享准备开始，到独立 NumPy 返回且 GPU 完成为止；只把合成源输入更新放在计时外。
 各候选持有独立 builder/adapter 和可变相机状态，并在下一次返回前保留上一次输出。
@@ -167,7 +171,9 @@ Tensor 的 stride 和广播视图有实际性能意义，不要为了整洁随�
 
 正确性默认检查第 0、1、7 帧，`--check-timed-steps` 扩展到所有实际计时帧；报告的 exact gate 只覆盖列出的 `checked_steps`。
 `backends` 会记录 uint8 差 1 并继续测量，但任何非零差异都不具备自动策略的画面一致性资格，差值超过 1 则明确失败。
-`check-backends` 的 CPU 对照要求逐字节一致，CUDA 默认允许差 1 并报告实际 exactness；`--max-uint8-diff 0` 可要求严格一致。
+`--require-exact bucketed` 将指定候选的门槛收紧为零差异。`--baseline` 指向保留源码目录，配合 `before_bucketed` 候选在同一进程隔离加载旧运行时；新旧候选仍各自持有 builder/adapter 和相机状态。
+`check-backends` 的 batch 与 bucketed 对照始终要求逐字节一致，CPU eager 对照也严格一致。
+仅 CUDA 加速结果与 eager 参考实现的对照默认允许差 1；`--max-uint8-diff 0` 将该参考对照也收紧为零差异，所有比较均报告实际 exactness。
 这些工具不自动改写执行策略。确认测量时，应让轮数是候选数的整数倍，以完整轮换候选顺序。
 
 ```powershell
@@ -175,6 +181,12 @@ Tensor 的 stride 和广播视图有实际性能意义，不要为了整洁随�
 .\scripts\run.ps1 check-backends --device cpu
 .\scripts\run.ps1 check-backends --device cuda:0 --output results/backend_contracts.json
 .\scripts\run.ps1 check-policy
+```
+
+新旧桶与 batch 的严格对照示例（保留源码目录不提交 Git）：
+
+```powershell
+.\scripts\run.ps1 backends --baseline results/baseline_bucketed_9c6e930 --candidates before_bucketed bucketed batch_whole --require-exact bucketed --batches 8 --slots 16 --profiles three --layouts static translate resize --rounds 3 --check-timed-steps
 ```
 
 ## 后续迭代习惯
@@ -190,4 +202,4 @@ Tensor 的 stride 和广播视图有实际性能意义，不要为了整洁随�
 
 新增处理优先放在负责该阶段的现有函数附近。内核保留数学坐标和 stride 命名；host 代码使用能说明职责的名称。
 更改执行策略必须补完整 NumPy 对照；更改数值核必须补原算法/旧源码对照，不依靠逐轮放宽容差。
-本轮验收见 [BACKEND_COMPARISON_REVIEW.md](BACKEND_COMPARISON_REVIEW.md)；此前可读性重构记录保留在 [READABILITY_REVIEW.md](READABILITY_REVIEW.md)。
+本轮验收见 [BUCKETED_OPTIMIZATION_REVIEW.md](BUCKETED_OPTIMIZATION_REVIEW.md)；此前后端对比与可读性重构记录分别保留在 [BACKEND_COMPARISON_REVIEW.md](BACKEND_COMPARISON_REVIEW.md) 和 [READABILITY_REVIEW.md](READABILITY_REVIEW.md)。

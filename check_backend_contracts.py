@@ -6,11 +6,13 @@ Run GPU checks serially, outside any performance measurement:
     python check_backend_contracts.py --device cuda:0
 
 CPU checks require exact eager outputs. CUDA additionally checks dense/separable
-Triton paths against the frozen eager reference and each other. Their default
-uint8 tolerance is one level, matching the existing accelerated checks; every
-comparison reports whether it was actually bitexact. Use --max-uint8-diff 0 when
-an execution-policy change requires strict bitexact output. This is a synthetic
-correctness fixture and makes no performance or production-callback claims.
+Triton paths against the frozen eager reference and each other. Every batch/bucket
+comparison requires exact uint8 parity. Only accelerated outputs versus the eager
+reference use --max-uint8-diff, which defaults to one level; set it to 0 to require
+exact reference parity too. Every comparison reports whether it was bitexact.
+CUDA also runs a fixed 1080p sampling regression with exact batch/bucket parity.
+This is a synthetic correctness fixture and makes no performance or
+production-callback claims.
 """
 
 from __future__ import annotations
@@ -188,7 +190,7 @@ def check_core(device, tolerance):
             bucket_output = render_bucket(args, BOXES, options, None if index < 2 else AREA_CAPS)
             rows.append(compare(batch_output, reference, label + ":batch/reference", limit))
             rows.append(compare(bucket_output, reference, label + ":bucketed/reference", limit))
-            rows.append(compare(bucket_output, batch_output, label + ":bucketed/batch", limit))
+            rows.append(compare(bucket_output, batch_output, label + ":bucketed/batch", 0))
     return rows
 
 
@@ -231,51 +233,70 @@ def check_transparent_overwrite(device):
     return rows
 
 
-def check_adapter_mutations(device, tolerance):
-    """Reuse live adapters across geometry, opacity and asset-cache transitions."""
+def _check_adapter_step(call, renderers, retained, label, *, must_change=False):
+    """Check live-cache output against fresh adapters and all retained results."""
     import numpy as np
-    import torch
-    from benchmark_paste_gpu_batch import adapter_options, identity_grid, make_adapter_case
     from paste_gpu_batch_adapter import PasteBatchAdapter
 
-    args, _ = make_fixture(device, 3)
-    call = list(make_adapter_case(args, BOXES))
-    owner, _, data, _, _, paste_args = call
+    batch = len(call[0].imgs_raw_groups)
+    height, width = call[1].shape[-3:-1]
+    shape = (height, width, 3) if batch == 1 else (batch, height, width, 3)
+    outputs, rows = {}, []
+    for backend, renderer in renderers.items():
+        actual = renderer(*call)
+        assert actual.shape == shape and actual.flags.c_contiguous
+        fresh = PasteBatchAdapter(renderer.options)(*call)
+        rows.append(compare(actual, fresh, f"{label}:{backend}/fresh", 0))
+        if must_change:
+            assert not np.array_equal(actual, retained[backend][-1][1]), (
+                f"{label}: ineffective fixture mutation"
+            )
+        for prior, snapshot in retained[backend]:
+            np.testing.assert_array_equal(prior, snapshot)
+            assert not np.shares_memory(actual, prior), "output storage reused"
+        retained[backend].append((actual, actual.copy()))
+        outputs[backend] = actual
+    rows.append(compare(outputs["bucketed"], outputs["batch"], f"{label}:bucketed/batch", 0))
+    return rows
+
+
+def _adapter_renderers(device, **overrides):
+    from benchmark_paste_gpu_batch import adapter_options
+    from paste_gpu_batch_adapter import PasteBatchAdapter
+
     options = replace(
         adapter_options("triton" if device.type == "cuda" else "eager", max_cached_sizes=4),
         pinned_output=device.type == "cuda",
         batch_chunk_size=0,
         area_caps=AREA_CAPS,
+        **overrides,
     )
-    renderers = {
+    return {
         backend: PasteBatchAdapter(replace(options, backend=backend))
         for backend in ("batch", "bucketed")
     }
+
+
+def check_adapter_mutations(device):
+    """Cache assets by source/group identity while geometry and opacity stay live."""
+    import torch
+    from benchmark_paste_gpu_batch import identity_grid, make_adapter_case
+
+    args, _ = make_fixture(device, 3)
+    call = list(make_adapter_case(args, BOXES))
+    owner, _, data, _, _, paste_args = call
+    renderers = _adapter_renderers(device)
     retained = {backend: [] for backend in renderers}
     rows = []
 
     def render_step(label, *, must_change=False):
-        outputs = {}
-        for backend, renderer in renderers.items():
-            actual = renderer(*call)
-            assert actual.shape == (3, HEIGHT, WIDTH, 3) and actual.flags.c_contiguous
-            fresh = PasteBatchAdapter(replace(options, backend=backend))(*call)
-            rows.append(compare(actual, fresh, f"{label}:{backend}/fresh", 0))
-            if must_change:
-                assert not np.array_equal(actual, retained[backend][-1][1]), (
-                    f"{label}: ineffective fixture mutation"
-                )
-            for prior, snapshot in retained[backend]:
-                np.testing.assert_array_equal(prior, snapshot)
-                assert not np.shares_memory(actual, prior), "output storage reused"
-            retained[backend].append((actual, actual.copy()))
-            outputs[backend] = actual
-        rows.append(
-            compare(
-                outputs["bucketed"],
-                outputs["batch"],
-                f"{label}:bucketed/batch",
-                tolerance if device.type == "cuda" else 0,
+        rows.extend(
+            _check_adapter_step(
+                call,
+                renderers,
+                retained,
+                label,
+                must_change=must_change,
             )
         )
 
@@ -288,13 +309,31 @@ def check_adapter_mutations(device, tolerance):
     assert renderers["bucketed"]._bucket_ads is packed
     data["ad_params"][2]["transparency"].mul_(0.25)
     render_step("opacity updated in place", must_change=True)
+    assert renderers["bucketed"]._bucket_ads is packed
     prior_layout = renderers["bucketed"]._layout
     data["ad_params"][0]["bbox"] = (2, 1, 14, 10)
     render_step("bbox moved, same ROI size", must_change=True)
     assert renderers["bucketed"]._layout is not prior_layout
+    assert renderers["bucketed"]._bucket_ads is packed
     data["ad_params"][0]["bbox"] = (1, 1, 19, 7)
     paste_args[-1][0] = identity_grid(6, 18, device)
     render_step("ROI reshaped, same area", must_change=True)
+    assert renderers["bucketed"]._bucket_ads is packed
+
+    prior_layout = renderers["bucketed"]._layout
+    for renderer in renderers.values():
+        renderer.options = replace(renderer.options, area_caps=(64, 512))
+    render_step("area capacities changed, same ordered groups")
+    assert renderers["bucketed"]._layout is not prior_layout
+    assert renderers["bucketed"]._bucket_ads is packed
+
+    # Slot 2 crosses the 64-pixel boundary and joins slot 0's source-size bucket.
+    data["ad_params"][2]["bbox"] = (2, 2, 11, 10)
+    data["ad_params"][2]["transparency"] = torch.full((3, 1, 8, 9), 0.31, device=device)
+    paste_args[-1][2] = identity_grid(8, 9, device)
+    render_step("ROI crosses capacity boundary and changes membership", must_change=True)
+    assert renderers["bucketed"]._bucket_ads is not packed
+
     prior_layout = renderers["bucketed"]._layout
     packed = renderers["bucketed"]._bucket_ads
     for group in owner.imgs_raw_groups:
@@ -302,23 +341,169 @@ def check_adapter_mutations(device, tolerance):
     render_step("new source object, same size and revision", must_change=True)
     assert renderers["bucketed"]._layout is prior_layout
     assert renderers["bucketed"]._bucket_ads is not packed
+    packed = renderers["bucketed"]._bucket_ads
     for group in owner.imgs_raw_groups:
         group["ad0"]["img"] = torch.full((9, 8, 4), 173.0, device=device)
     data["ad_params"][0]["ad_h_w"] = (9, 8)
     render_step("new source object and size, unchanged revision", must_change=True)
     assert renderers["bucketed"]._layout is not prior_layout
+    assert renderers["bucketed"]._bucket_ads is not packed
+    packed = renderers["bucketed"]._bucket_ads
     owner.imgs_raw_groups[0]["ad0"]["img"][..., :3].add_(23)
     owner.imgs_raw_version += 1
     render_step("source changed in place, revision incremented", must_change=True)
+    assert renderers["bucketed"]._bucket_ads is not packed
+    packed = renderers["bucketed"]._bucket_ads
     data["ad_params"].reverse()
     render_step("slot order reversed", must_change=True)
+    assert renderers["bucketed"]._bucket_ads is not packed
+
+    packed = renderers["bucketed"]._bucket_ads
+    # Keep the surviving source objects identical; only batch membership changes.
+    owner.imgs_raw_groups = owner.imgs_raw_groups[:1]
+    call[1] = call[1][0]
+    for slot, grid in paste_args[-1].items():
+        paste_args[-1][slot] = grid[:1]
+    for param in data["ad_params"]:
+        param["transparency"] = param["transparency"][:1]
+    render_step("batch reduced from three to one", must_change=True)
+    assert renderers["bucketed"]._bucket_ads is not packed
+
+    packed = renderers["bucketed"]._bucket_ads
+    for renderer in renderers.values():
+        renderer.invalidate_assets()
+    render_step("explicit asset invalidation")
+    assert renderers["bucketed"]._bucket_ads is not packed
+    return rows
+
+
+def check_bucket_group_mutations(device):
+    """Detect reordered members even when every packed bucket retains its shape."""
+    import torch
+    from benchmark_paste_gpu_batch import identity_grid, make_adapter_case
+
+    args, _ = make_fixture(device, 2)
+    frames, sources, _, distortion, kernel, mask, _ = args
+    boxes = ((1, 1, 9, 5), (3, 2, 11, 7), (5, 3, 15, 11), (8, 5, 20, 13))
+    ads = []
+    for slot in range(4):
+        ad = sources[0].clone()
+        ad[:, :3].mul_(0.7).add_(slot * 13)
+        ads.append(ad)
+    grids = tuple(identity_grid(y2 - y1, x2 - x1, device) for x1, y1, x2, y2 in boxes)
+    opacity = tuple(torch.full((1, 1, 1, 1), 0.55 + 0.1 * slot, device=device) for slot in range(4))
+    call = list(make_adapter_case((frames, ads, grids, distortion, kernel, mask, opacity), boxes))
+    renderers = _adapter_renderers(device)
+    retained = {backend: [] for backend in renderers}
+    rows = _check_adapter_step(call, renderers, retained, "member swap initial")
+    packed = renderers["bucketed"]._bucket_ads
+    before_shapes = tuple(tuple(tensor.shape) for tensor in packed)
+    assert renderers["bucketed"]._layout["groups"] == ((0, 1), (2, 3))
+    # Exchange area bins for slots 1 and 2; the two B*2 source stacks keep their shapes.
+    for slot, box in ((1, (3, 2, 13, 10)), (2, (5, 3, 13, 8))):
+        call[2]["ad_params"][slot]["bbox"] = box
+        x1, y1, x2, y2 = box
+        call[-1][-1][slot] = identity_grid(y2 - y1, x2 - x1, device)
+    rows.extend(
+        _check_adapter_step(call, renderers, retained, "equal-size member swap", must_change=True)
+    )
+    assert renderers["bucketed"]._layout["groups"] == ((0, 2), (1, 3))
+    assert renderers["bucketed"]._bucket_ads is not packed
+    assert (
+        tuple(tuple(tensor.shape) for tensor in renderers["bucketed"]._bucket_ads) == before_shapes
+    )
+
+    for cache_mode in ("disabled", "missing revision"):
+        if cache_mode == "disabled":
+            renderers = _adapter_renderers(device, cache_ads=False)
+        else:
+            call[0].imgs_raw_version = None
+            renderers = _adapter_renderers(device)
+        retained = {backend: [] for backend in renderers}
+        rows.extend(_check_adapter_step(call, renderers, retained, f"cache {cache_mode}:first"))
+        packed = renderers["bucketed"]._bucket_ads
+        rows.extend(_check_adapter_step(call, renderers, retained, f"cache {cache_mode}:repeat"))
+        assert renderers["bucketed"]._bucket_ads is not packed
+    return rows
+
+
+def check_sampling_rounding_regression(device):
+    """Fixed fixture that exposed old grid_sample/Triton uint8 differences on CUDA.
+
+    With the previous bucketed grid_sample route, seed 24680 and steps 0/1/7
+    differed from whole-batch Triton in 5/9/4 channels, each by one uint8 level,
+    on the deployment GPU. Both routes now use the same sampling arithmetic.
+    This is deliberately a full-resolution regression, not a performance test.
+    """
+    if device.type != "cuda":
+        return []
+    import torch
+    from types import SimpleNamespace
+    from benchmark_backend_comparison import CandidateState, create_fixture
+    from benchmark_paste_gpu_batch import make_case
+
+    options = SimpleNamespace(
+        batch=8,
+        slots=16,
+        height=1080,
+        width=1920,
+        kernel_size=9,
+        ad_sizes=((200, 200), (500, 500), (300, 600)),
+        sigma_pattern="continuous",
+        acceleration="triton",
+        dense_blur_backend="triton",
+        normalization="legacy",
+        camera_index_policy="legacy",
+        align_corners=False,
+        forward=False,
+        inverse_iterations=10,
+    )
+    torch.manual_seed(24680)
+    args, boxes = make_case(
+        device,
+        batch=options.batch,
+        height=options.height,
+        width=options.width,
+        slots=options.slots,
+        realistic=True,
+        kernel_size=options.kernel_size,
+        source_sizes=options.ad_sizes,
+    )
+    boxes = (boxes[0], boxes[0], *boxes[2:])
+    rows = []
+    for blur in ("triton", "separable"):
+        states = {
+            backend: CandidateState(
+                backend, create_fixture(options, device, args, boxes, "static"), blur
+            )
+            for backend in ("batch_whole", "bucketed")
+        }
+        for step in (0, 1, 7):
+            outputs = {}
+            for backend, state in states.items():
+                state.path.fixture.set_frame(step)
+                outputs[backend] = state.path.render()
+            rows.append(
+                compare(
+                    outputs["bucketed"],
+                    outputs["batch_whole"],
+                    f"sampling rounding seed24680,B8,S16,1080p,{blur},step={step}",
+                    0,
+                )
+            )
     return rows
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--device", default="cpu")
-    parser.add_argument("--max-uint8-diff", type=int, choices=(0, 1), default=1)
+    parser.add_argument(
+        "--max-uint8-diff",
+        type=int,
+        choices=(0, 1),
+        default=1,
+        help="accelerated/eager-reference tolerance; batch/bucket parity is always exact",
+    )
     parser.add_argument("--output", type=Path)
     cli = parser.parse_args()
     import torch
@@ -341,7 +526,9 @@ def main():
             comparisons=check_core(device, cli.max_uint8_diff),
         )
         report["comparisons"].extend(check_transparent_overwrite(device))
-        report["comparisons"].extend(check_adapter_mutations(device, cli.max_uint8_diff))
+        report["comparisons"].extend(check_adapter_mutations(device))
+        report["comparisons"].extend(check_bucket_group_mutations(device))
+        report["comparisons"].extend(check_sampling_rounding_regression(device))
     report["all_bitexact"] = all(row["bitexact"] for row in report["comparisons"])
     report["gpu_checks_run"] = device.type == "cuda"
     if cli.output:
