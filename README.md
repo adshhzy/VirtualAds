@@ -5,6 +5,8 @@
 本轮完成职责拆分、命名与格式整理、基准工具去重，保留原业务接口、画面语义和动态路数策略。
 先读 [代码阅读与修改指南](ARCHITECTURE.md)，再看 [重构验收记录](READABILITY_REVIEW.md)。动态路数优化的启用范围和历史结果见 [DYNAMIC_BATCH_REVIEW.md](DYNAMIC_BATCH_REVIEW.md)。
 
+[dynamic_paste_example.py](dynamic_paste_example.py) 展示业务 worker 初始化一次、每帧更新素材组/相机参数并返回原 NumPy 接口；沿用真实业务回调。
+
 格式与静态检查：`.\scripts\lint.ps1`；自动格式化后检查：`.\scripts\lint.ps1 -Fix`。工具使用独立 uv 环境，不改 GPU 依赖。
 
 原包基线来自[最新分享会话](https://chatgpt.com/share/6ad82a9c-6d28-83ec-a454-ff17371706f4)的 `paste_gpu_performance_perf4_1.zip`，SHA256 为 `c1fbb5865f284d13b57cff251c6e11130add09b7af8f76e60fc3feae1c28a43a`。同步时13个原包文件逐字节校验，保存于Git提交 `0b97beb`；当前文件包含之后的本地优化，不再宣称与压缩包逐字节一致。历史记录见 [PERF4_1_REVIEW.md](PERF4_1_REVIEW.md)。
