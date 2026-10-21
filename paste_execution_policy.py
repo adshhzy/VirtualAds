@@ -2,7 +2,7 @@
 
 Only tensor metadata is inspected. Camera/grid/kernel values stay live. Unknown
 hardware, shapes, layouts or batches use the original whole-batch path.
-See DYNAMIC_BATCH_REVIEW.md for measurements and reproduction commands.
+See DYNAMIC_BATCH_REVIEW.md and BACKEND_COMPARISON_REVIEW.md for measurements.
 """
 
 from functools import lru_cache
@@ -15,6 +15,20 @@ CHUNK_BY_BATCH = {batch: (0 if batch <= 5 else 4) for batch in range(1, 17)}
 # None retains the original 128x4/four-warps kernels.
 BLUR_BY_BATCH = {batch: None for batch in CHUNK_BY_BATCH}
 SOURCE_SIZES = ((200, 200), (500, 500), (300, 600))
+
+# Additional layouts passed full-call mean and P95 gains >=5% in both static
+# and translated layouts, all four rounds faster, with bit-exact checked frames.
+# A key is (slot_count, ordered_source_hws, batch), where
+# ordered_source_hws contains one (H, W) pair per slot, including repetitions.
+# Values pair the chunk size and blur launch configuration atomically.
+# 32-slot cases did not pass both latency gates. The original 16-slot/three-size
+# profile above retains its previously measured batch range and takes priority.
+ADDITIONAL_PROFILE_ID = "4090-win-cu128-1080p-k9-layouts-v1"
+ADDITIONAL_PROFILES = {
+    (slots, tuple(SOURCE_SIZES[index % size_count] for index in range(slots)), batch): (4, None)
+    for slots, size_count in ((4, 1), (4, 2), (4, 3), (16, 1), (16, 2))
+    for batch in (8, 16)
+}
 
 
 @lru_cache(maxsize=16)
@@ -53,7 +67,7 @@ def _supports_profile_backend(frames, options):
     )
 
 
-def _matches_frame_and_kernel(frames, kernel, boxes, options, blur_factors):
+def _matches_frame_and_kernel(frames, kernel, boxes, options, blur_factors, *, slot_count=16):
     """Require the measured shared 1080p background and shared 9x9 kernel."""
     # NCHW view over one HWC frame: RGB is the innermost storage dimension.
     if tuple(frames.shape) != (1, 3, 1080, 1920) or frames.stride()[1:] != (1, 5760, 3):
@@ -71,7 +85,7 @@ def _matches_frame_and_kernel(frames, kernel, boxes, options, blur_factors):
         ):
             return False
     return (
-        len(boxes) == 16
+        len(boxes) == slot_count
         and options.legacy_alpha
         and not options.warp_align_corners
         and not options.distortion_align_corners
@@ -92,11 +106,13 @@ def _matches_shared_layout(mask, distortion):
     return True
 
 
-def _matches_slot_layout(ads, grids, boxes, opacity):
+def _matches_slot_layout(ads, grids, boxes, opacity, *, source_sizes=None):
     """Match source-size order, shared ROI grids and scalar slot opacity."""
+    if source_sizes is None:
+        source_sizes = SOURCE_SIZES
     for slot_index, (ad, grid, box, alpha) in enumerate(zip(ads, grids, boxes, opacity)):
         if (
-            tuple(ad.shape[-2:]) != SOURCE_SIZES[slot_index % len(SOURCE_SIZES)]
+            tuple(ad.shape[-2:]) != source_sizes[slot_index % len(source_sizes)]
             or not ad.is_contiguous()
             or (box[3] - box[1], box[2] - box[0]) != (108, 320)
             or tuple(grid.shape) != (1, 108, 320, 2)
@@ -105,6 +121,21 @@ def _matches_slot_layout(ads, grids, boxes, opacity):
         ):
             return False
     return True
+
+
+def _additional_profile(ads, boxes, batch):
+    """Look up an exact extra layout without overriding the original profile.
+
+    The original 16-slot/three-size layout always uses CHUNK_BY_BATCH and
+    BLUR_BY_BATCH, including their missing-entry fallbacks. Camera values,
+    pixels and bbox positions are not read or retained by this lookup.
+    """
+    source_hws = tuple(tuple(ad.shape[-2:]) for ad in ads)
+    original_sources = tuple(SOURCE_SIZES[index % len(SOURCE_SIZES)] for index in range(16))
+    if len(boxes) == 16 and source_hws == original_sources:
+        return None, None
+    profile = ADDITIONAL_PROFILES.get((len(boxes), source_hws, batch))
+    return profile, source_hws if profile is not None else None
 
 
 def choose_execution(args, boxes, options, blur_factors):
@@ -118,14 +149,23 @@ def choose_execution(args, boxes, options, blur_factors):
     if not _supports_profile_backend(frames, options):
         return 0, None, "unsupported_backend_or_output"
     batch = ads[0].shape[0]
-    if batch not in CHUNK_BY_BATCH or batch not in BLUR_BY_BATCH:
+    profile, source_sizes = (None, None)
+    if ADDITIONAL_PROFILES:
+        profile, source_sizes = _additional_profile(ads, boxes, batch)
+    if profile is None and (batch not in CHUNK_BY_BATCH or batch not in BLUR_BY_BATCH):
         return 0, None, "unmeasured_batch"
-    if not _matches_frame_and_kernel(frames, kernel, boxes, options, blur_factors):
+    slot_count = 16 if profile is None else len(boxes)
+    if not _matches_frame_and_kernel(
+        frames, kernel, boxes, options, blur_factors, slot_count=slot_count
+    ):
         return 0, None, "unmeasured_frame_or_kernel"
     if not _matches_shared_layout(mask, distortion):
         return 0, None, "unmeasured_broadcast_layout"
-    if not _matches_slot_layout(ads, grids, boxes, opacity):
+    if not _matches_slot_layout(ads, grids, boxes, opacity, source_sizes=source_sizes):
         return 0, None, "unmeasured_slot_layout"
     if not _measured_environment(frames.device.index):
         return 0, None, "unmeasured_environment"
+    if profile is not None:
+        chunk_size, blur_config = profile
+        return chunk_size, blur_config, ADDITIONAL_PROFILE_ID
     return CHUNK_BY_BATCH[batch], BLUR_BY_BATCH.get(batch), PROFILE_ID

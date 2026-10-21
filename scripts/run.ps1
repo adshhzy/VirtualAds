@@ -1,5 +1,5 @@
 # Deliberately not an advanced script: unknown CLI flags remain in $args.
-param([ValidateSet('shared', 'batch', 'dynamic', 'compare', 'tune', 'check')][string]$Benchmark = 'shared')
+param([ValidateSet('shared', 'batch', 'dynamic', 'compare', 'backends', 'tune', 'check', 'check-backends', 'check-policy')][string]$Benchmark = 'shared')
 
 $ErrorActionPreference = 'Stop'
 $projectPath = Split-Path -Parent $PSScriptRoot
@@ -15,8 +15,11 @@ $benchmarkFile = switch ($Benchmark) {
     'batch' { 'benchmark_paste_gpu_batch.py' }
     'dynamic' { 'benchmark_dynamic_batch.py' }
     'compare' { 'benchmark_dynamic_comparison.py' }
+    'backends' { 'benchmark_backend_comparison.py' }
     'tune' { 'benchmark_blur_tuning.py' }
     'check' { 'test_dynamic_batch.py' }
+    'check-backends' { 'check_backend_contracts.py' }
+    'check-policy' { 'test_backend_policy.py' }
 }
 $benchmarkPath = Join-Path $projectPath $benchmarkFile
 $previousTritonCache = $env:TRITON_CACHE_DIR

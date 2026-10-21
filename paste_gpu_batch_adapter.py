@@ -124,7 +124,7 @@ else:
         validate_inputs,
     )
 
-ADAPTER_VERSION = "2026-10-21-perf4.2-readable"
+ADAPTER_VERSION = "2026-10-21-perf4.3-backends"
 
 
 @dataclass(frozen=True)

@@ -1,17 +1,15 @@
 # GPU 广告贴图库
 
-这是 PyTorch / Triton GPU 贴图库和命令行基准程序，没有 Web 服务或浏览器界面。当前本地版本为 `2026-10-21-perf4.2-readable`，位于 `E:\dev\virtualAds\paste_gpu_performance`。
+这是 PyTorch / Triton GPU 贴图库和命令行基准程序，没有 Web 服务或浏览器界面。当前本地版本为 `2026-10-21-perf4.3-backends`，位于 `E:\dev\virtualAds\paste_gpu_performance`。
 
-本轮完成职责拆分、命名与格式整理、基准工具去重，保留原业务接口、画面语义和动态路数策略。
-先读 [代码阅读与修改指南](ARCHITECTURE.md)，再看 [重构验收记录](READABILITY_REVIEW.md)。动态路数优化的启用范围和历史结果见 [DYNAMIC_BATCH_REVIEW.md](DYNAMIC_BATCH_REVIEW.md)。
+本轮补充 batch / bucketed 的完整流程对比、后端契约与自动策略回归，并按实测证据限定分块策略。
+先读 [代码阅读与修改指南](ARCHITECTURE.md)；最新测量、准入范围和验收见 [后端对比报告](BACKEND_COMPARISON_REVIEW.md)。默认后端继续使用 `batch`。
 
 [dynamic_paste_example.py](dynamic_paste_example.py) 展示业务 worker 初始化一次、每帧更新素材组/相机参数并返回原 NumPy 接口；沿用真实业务回调。
 
 格式与静态检查：`.\scripts\lint.ps1`；自动格式化后检查：`.\scripts\lint.ps1 -Fix`。工具使用独立 uv 环境，不改 GPU 依赖。
 
-原包基线来自[最新分享会话](https://chatgpt.com/share/6ad82a9c-6d28-83ec-a454-ff17371706f4)的 `paste_gpu_performance_perf4_1.zip`，SHA256 为 `c1fbb5865f284d13b57cff251c6e11130add09b7af8f76e60fc3feae1c28a43a`。同步时13个原包文件逐字节校验，保存于Git提交 `0b97beb`；当前文件包含之后的本地优化，不再宣称与压缩包逐字节一致。历史记录见 [PERF4_1_REVIEW.md](PERF4_1_REVIEW.md)。
-
-最初 perf4 来自[原分享会话](https://chatgpt.com/share/6ad7de37-4b64-83ec-9ac2-1ad7013e17b5)，归档 SHA256 为 `17c6354f8c478a74daa52cc6f0294a21fb71fc1eb22b2e811b8e6d1130b6a26b`；Git 原始代码基线为 `480fad5`。原包的说明保留在 [SHARED_PIPELINE_README.md](SHARED_PIPELINE_README.md) 和 [paste_gpu_performance_README.txt](paste_gpu_performance_README.txt)。
+代码来源于[原分享会话](https://chatgpt.com/share/6ad7de37-4b64-83ec-9ac2-1ad7013e17b5)及[perf4.1 分享会话](https://chatgpt.com/share/6ad82a9c-6d28-83ec-a454-ff17371706f4)。归档与原包校验见 [PERF4_1_REVIEW.md](PERF4_1_REVIEW.md)，初次部署记录见 [VALIDATION.md](VALIDATION.md)；当前代码包含后续本地优化。原包说明保留在 [SHARED_PIPELINE_README.md](SHARED_PIPELINE_README.md) 和 [paste_gpu_performance_README.txt](paste_gpu_performance_README.txt)。
 
 ## 环境与启动
 
@@ -62,6 +60,29 @@ New-Item -ItemType Directory -Force results | Out-Null
 .\scripts\run.ps1 shared --device cuda:0 --batch 8 --slots 16 --ad-sizes 200x200 500x500 --diagnose *> results\shared-two-sizes.log
 ```
 
+## 后端对比与回归
+
+本轮覆盖 B=1/4/8/16、4/16/32 个广告位、1～3 种素材尺寸、静态/平移/缩放 bbox，共 108 个合成场景。
+完整计时包含共享准备、素材缓存与打包、每帧 grid/透明度打包、布局/LUT 更新，以及完成 GPU 工作后的独立 NumPy 返回。
+`bucketed` 在其中 104 个场景有最大 1 级 uint8 差异，另外 4 个逐字节一致的场景更慢，未达到零差异和性能准入要求；不会自动替换 `batch`。
+动态 bbox 还会触发 bucket LUT 和当前桶素材重打包，不能用静态缓存结果推断其收益。
+
+| 命令 | 工具 | 用途 |
+|---|---|---|
+| `scripts/run.ps1 backends` | `benchmark_backend_comparison.py` | 比较整批、auto、手动 C4 与 bucketed；记录完整延迟、正确性和缓存/布局计数 |
+| `scripts/run.ps1 check-backends` | `check_backend_contracts.py` | 检查后端覆盖顺序、广播、布局/素材更新和输出所有权 |
+| `scripts/run.ps1 check-policy` | `test_backend_policy.py` | CPU 元数据测试，检查策略精确准入与未知输入回退 |
+| `scripts/run.ps1 compare` | `benchmark_dynamic_comparison.py` | 隔离加载旧源码对照当前完整调用；`--slots` 指定广告位数，默认 16 |
+
+```powershell
+.\scripts\run.ps1 backends --batches 8 --slots 16 --profiles three --layouts static --check-timed-steps
+.\scripts\run.ps1 check-backends --device cpu
+.\scripts\run.ps1 check-policy
+```
+
+`backends` 默认检查第 0、1、7 帧；确认策略时使用 `--check-timed-steps` 覆盖实际计时帧，零差异门槛只对报告中的 `checked_steps` 成立。
+冷素材单次耗时、独立诊断与确认测量的使用方式见 [ARCHITECTURE.md](ARCHITECTURE.md) 和 [最新报告](BACKEND_COMPARISON_REVIEW.md)。
+
 ## 接入与迭代约束
 
 生产接入入口是 `shared_paste_example.py`，调用 `setup_shared_paste` 初始化 worker，再每帧调用 `prepare_shared_paste_args` 与 adapter。需要接入现有业务对象和真实数据，不能把基准 fixture 当成生产应用。
@@ -70,6 +91,8 @@ New-Item -ItemType Directory -Force results | Out-Null
 
 `AdapterOptions.batch_chunk_size` 默认 `"auto"`：仅匹配已测硬件和输入结构时应用离线策略，未知情况回退整批。`0` 强制原整批，正整数强制指定分块上限。`last_execution` 可查看实际选择和回退原因。NumPy保持独立存储，返回即可读取；内部复制流不改变调用方串行调用约定。自动策略不强行启用可分离模糊，仍需真实核验证。
 
+本轮新增准入限定在 B8/B16、4 或 16 个广告位、已测素材尺寸循环和 108×320 ROI 等完整条件内，并保留现有硬件/软件门槛。精确准入表见 [paste_execution_policy.py](paste_execution_policy.py) 和 [后端对比报告](BACKEND_COMPARISON_REVIEW.md)；不要据此推广到 32 个广告位或任意输入结构。
+
 默认 `normalization="legacy"`、`camera_index_policy="legacy"` 保留原行为；`matched` / `corrected` 是需要单独验收的语义修正。保持 B1 输出 `[H,W,3]`、多组输出 `[B,H,W,3]` 的 NumPy `uint8` 协议；K、畸变系数和单应矩阵须实时读取。GPU worker 初始化及预热后复用 builder / adapter，素材变更按既有接口使缓存失效。
 
-原包文档中的“本地没有 CUDA GPU”描述的是打包时的环境。本次部署的实际 GPU 校验和计时结果见 [VALIDATION.md](VALIDATION.md)；合成基准通过不等于完成生产视频验收。
+原包文档中的“本地没有 CUDA GPU”描述的是打包时的环境。初次部署的 GPU 校验见 [VALIDATION.md](VALIDATION.md)，本轮结果见 [后端对比报告](BACKEND_COMPARISON_REVIEW.md)；合成基准通过不等于完成生产视频验收。

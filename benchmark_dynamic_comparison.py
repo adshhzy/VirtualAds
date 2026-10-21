@@ -30,6 +30,7 @@ def parse_arguments():
     parser.add_argument("--baseline", type=Path, default=Path("results/baseline_perf4_1"))
     parser.add_argument("--baseline-label", default="perf4.1")
     parser.add_argument("--batches", type=int, nargs="+", default=[1, 2, 3, 4, 5, 8, 12, 16])
+    parser.add_argument("--slots", type=int, default=16)
     parser.add_argument(
         "--chunks", nargs="+", default=["auto"], help="auto or nonnegative integers"
     )
@@ -51,6 +52,7 @@ def parse_arguments():
     if (
         min(
             *options.batches,
+            options.slots,
             options.height,
             options.width,
             options.kernel_size,
@@ -101,7 +103,7 @@ class ComparisonCase:
             batch=batch,
             height=options.height,
             width=options.width,
-            slots=16,
+            slots=options.slots,
             realistic=True,
             kernel_size=options.kernel_size,
             source_sizes=source_sizes,
@@ -110,7 +112,7 @@ class ComparisonCase:
             batch=batch,
             height=options.height,
             width=options.width,
-            slots=16,
+            slots=options.slots,
             kernel_size=options.kernel_size,
             ad_sizes=source_sizes,
             sigma_pattern="continuous",

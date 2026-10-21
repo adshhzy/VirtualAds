@@ -31,8 +31,8 @@ import sys
 import time
 from types import SimpleNamespace
 
-BENCHMARK_VERSION = "2026-10-21-perf4.2-readable"
-DIAGNOSTIC_ADAPTER_VERSION = "2026-10-21-perf4.2-readable"
+BENCHMARK_VERSION = "2026-10-21-perf4.3-backends"
+DIAGNOSTIC_ADAPTER_VERSION = "2026-10-21-perf4.3-backends"
 
 
 def parse_ad_size(value):
