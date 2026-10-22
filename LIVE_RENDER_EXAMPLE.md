@@ -1,4 +1,6 @@
-# 可运行的直播渲染循环示例
+# 旧 render_frame 的直播渲染循环示例
+
+本文保留兼容入口 `render_frame` 的 packet/source/sink 协议。新业务要求的 `render_img(data_dict, frame, imgs_raw)` 使用 [启动与在线业务接入](STARTUP_AND_API.md) 和 [render_img_example.py](render_img_example.py)，启动命令为 `.\scripts\run.ps1 render-img-example --device cuda:0`。两种入口的输入结构和路号类型不同，不混用示例 packet。
 
 [live_render_example.py](live_render_example.py) 展示如何把已有帧源、业务 owner 和输出 sink 接到统一 `render_frame` 入口：worker 内初始化一次，持续消费当前帧与素材组，在暂停、恢复、换流和退出时管理资源。[live_render_demo.py](live_render_demo.py) 提供演示输入和检查型 sink，供命令行直接运行。
 

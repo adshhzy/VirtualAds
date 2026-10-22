@@ -2,6 +2,8 @@
 
 `ImageRenderer.render_img(data_dict, frame, imgs_raw)` 直接接收每帧业务字典、原始画面和素材字典。初始化一次，逐帧调用三参数方法；原 `render_frame`、`initialize_renderer` 和 adapter 接口继续兼容。
 
+安装、模块启动命令、owner 回调签名及完整业务循环模板见 [启动与在线业务接入](STARTUP_AND_API.md)。可直接运行 `.\scripts\run.ps1 render-img-example --device cuda:0` 检查三参数接口，源码为 [render_img_example.py](render_img_example.py)。以下片段使用业务已有对象。
+
 ```python
 from paste_renderer import ImageRenderer, RenderOptions
 
@@ -12,11 +14,16 @@ with ImageRenderer(owner, options, device="cuda:0") as renderer:
     render_img = renderer.render_img  # 可直接绑定成业务要求的三参数函数
     for data_dict, frame, imgs_raw in frame_source:
         output = render_img(data_dict, frame, imgs_raw)
-        if output.shape[0] == 0:  # B=0 暂停，无输出需要发送
-            continue
-        route_ids = renderer.route_ids
-        # B1: HWC；B>1: BHWC。route_ids 与批次下标对应。
-        sink.write_batch(route_ids, output)
+        batch = None
+        try:
+            route_ids = renderer.route_ids
+            if not route_ids:  # B=0 暂停，无输出需要发送
+                continue
+            # B1: HWC；B>1: BHWC。这里给业务 sink 统一成 BHWC 视图。
+            batch = output[None, ...] if output.ndim == 3 else output
+            sink.write_batch(route_ids, batch)
+        finally:
+            del batch, output  # 暂停或 sink 异常时也不保留上一批视图
 ```
 
 `frame_source`、`sink` 和 `owner` 由业务提供；上述是接线示例，不启动解码、编码或网络发送。一个 renderer/owner 对应一个串行 worker 和一个 GPU 计算流。`owner` 的三个既有方法必须为 callable：`compute_camera_motion_rate`、`motion_rate_to_sigma`、`create_gaussian_kernel`。默认 dense 模糊；只有实际业务核已验证可分离时才设置 `use_separable=True`。
@@ -43,6 +50,8 @@ with ImageRenderer(owner, options, device="cuda:0") as renderer:
 `imgs_raw` 是一份素材 bank，不是按路分组的字典。值支持单张 ndarray/Tensor，也兼容 `{"img": image}`；素材保持既有四通道格式与值域。RGB/BGR 不自动交换，应让背景和素材颜色通道顺序一致。旧设备图列表只通过固定 `options.image_index`（未指定为 0）选择，不把路号误当设备索引。同一素材 ID 可被不同路重复使用。
 
 通常 `frame` 为 `(1080,1920,3)`，也支持配置中的其它分辨率/布局；每次只能提供一张原始画面。返回值为独立、可立即读取的 NumPy uint8：B1 是 HWC，B>1 是 BHWC。后续渲染或 close 不覆盖调用方仍持有的结果。
+
+当前共享初始化固定 `squeeze_single=True` 和 NumPy 输出；给 `ImageRenderer` 传 `RenderOptions(squeeze_single=False)` 不会改变 B1 形状。下游需要统一批次维时按上面的 `ndim` 转换，不修改公开输出接口。owner/renderer 不跨线程或相机并发共用。
 
 ## 共用 mask 与羽化
 
@@ -96,7 +105,7 @@ GPU 完整调用对照可通过以下命令复跑，结果路径须未占用：
 
 `check_render_img.py` 使用明确标注的合成回调和图像，将每路结果与兼容 `render_frame` 单路调用逐字节对照。mask 另与 SciPy 独立卷积参考比较；真实视频素材和生产回调仍需业务验收。报告只记录检查与有限运行状态，不作为吞吐基准。
 
-## 本轮验收记录（2026-10-22）
+## 三参数入口初次验收记录（2026-10-22，历史）
 
 本机 CUDA 环境完成以下检查，运行时版本 `2026-10-22-perf4.7-render-img`：
 

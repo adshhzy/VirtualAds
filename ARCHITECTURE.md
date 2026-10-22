@@ -6,6 +6,8 @@
 
 ## 先从哪里读
 
+部署与线上调用先读 [STARTUP_AND_API.md](STARTUP_AND_API.md)，直接运行三参数例子 [render_img_example.py](render_img_example.py)。库内模块由 renderer 自动协作，无需分别启动进程。
+
 1. [paste_renderer.py](paste_renderer.py)：新业务 `ImageRenderer.render_img`，以及兼容 `initialize_renderer`、`render_frame`、`release_renderer`。
 2. [paste_render_executor.py](paste_render_executor.py) 的 `RenderExecutor.render_prepared`：输入准备、缓存、后端执行与 NumPy 导出。
 3. [paste_gpu_batch.py](paste_gpu_batch.py) 的 `paste_gpu_batch` / `_finish_canvas`：纯 Tensor 运算与后端选择。
@@ -39,6 +41,7 @@ flowchart TD
 | 文件 | 负责什么 | 适合在这里修改什么 |
 |---|---|---|
 | `paste_renderer.py` | 统一初始化、每帧共享准备和整体释放 | 新业务调用边界与 owner 接入 |
+| `render_img_example.py` | 新三参数入口的有限可运行演示 | 一次初始化、动态配置/素材、B0 与退出；合成回调不能替代生产 |
 | `paste_route_plan.py` | 从 ad_params_N 和精确素材 key 规划兼容布局组 | 路号排序、独立配置与 batch 对应 |
 | `paste_route_preparation.py` | 本次调用的素材描述和有界 CPU 参数工作区 | 消除重复解析、借用参数的内部生命周期与旧接口回退 |
 | `paste_frame_upload.py` | 连续 CPU uint8 背景的字节上传和 GPU float32 转换 | 共用背景工作区、输入类型回退 |

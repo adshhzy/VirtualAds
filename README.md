@@ -3,6 +3,21 @@
 VirtualAds 是 PyTorch / Triton GPU 广告贴图库和命令行基准程序，没有 Web 服务或浏览器界面。当前版本为 `2026-10-23-perf4.9-prepare`。
 
 新业务入口为 `ImageRenderer.render_img(data_dict, frame, imgs_raw)`：worker 初始化一次，从 `ad_params_N` 读取各路配置，合成并羽化共用 mask，相机/畸变准备一次后按兼容布局批量渲染。详见 [三参数接口说明](RENDER_IMG.md)。`render_frame` 和旧 adapter 继续兼容；既有贴图数学、默认 `batch` 与 `auto` 策略保持，新增 mask 羽化按要求改变遮挡边缘过渡。
+
+## 开始使用
+
+先读 [启动与在线业务接入](STARTUP_AND_API.md)：安装环境、各模块启动方式、生产 owner 回调、三参数调用、动态路数和退出清理都在其中。在线业务使用进程内 Python API；renderer 在直播 worker 内创建一次，再逐帧调用。
+
+已安装项目环境后，在仓库根目录运行新的三参数演示：
+
+```powershell
+.\scripts\run.ps1 render-img-example --device cuda:0 --frames-per-phase 2 --output results/render_img_demo.json
+```
+
+[render_img_example.py](render_img_example.py) 自带合成输入，演示动态路数、素材替换/原地更新、B0 暂停恢复和关闭，执行完退出。报告路径须未占用。需要旧 `render_frame` 的 packet/sink 示例时，继续使用 [live_render_example.py](live_render_example.py)。生产接入使用自己的相机回调、帧源和编码器。
+
+## 版本与验证记录
+
 perf4.7 三参数入口验收通过 117 项单元回归、1027 次合成调用及 3336 样例配置的 1080p 接线检查；逐路旧入口对照零像素差，mask 独立 Gaussian 参考误差小于 `1e-6`。该轮输入图像/回调为合成数据，验收边界与命令见 [RENDER_IMG.md](RENDER_IMG.md)。
 perf4.8 集中上传矩阵/透明度，并将连续 CPU uint8 背景的 float32 转换移到 GPU。真实 3336 输入的 B8/S16 固定/动态 bbox 完整调用平均耗时分别下降 17.75% / 8.94%，全部计时帧与旧源码逐像素一致；另完成 10,000 帧工作区复用检查，测量边界和内存成本见 [上传优化报告](UPLOAD_OPTIMIZATION_REVIEW.md)。
 
@@ -14,7 +29,7 @@ perf4.9 复用本帧素材描述和 CPU 参数工作区，并集中上传局部 
 
 [dynamic_paste_example.py](dynamic_paste_example.py) 与 [shared_paste_example.py](shared_paste_example.py) 保留旧业务辅助函数并委托统一入口；新调用方式见下方“接入与迭代约束”。所有方式均沿用真实业务回调。
 
-需要从可运行循环开始接入时，阅读 [直播 worker 示例](LIVE_RENDER_EXAMPLE.md)。它通过 `live-example` 命令演示动态 B、素材 revision、暂停/恢复、无广告及换流清理；演示源与 sink 使用合成数据和本地检查，不包含编码或真实推流。
+旧接口的 [直播 worker 示例](LIVE_RENDER_EXAMPLE.md) 通过 `live-example` 命令演示动态 B、素材 revision、暂停/恢复、无广告及换流清理；演示源与 sink 使用合成数据和本地检查，不包含编码或真实推流。
 
 `ImageRenderer` 自带默认容量 9 的有界相机历史，退出使用 `with` 或 `renderer.close()`，同时释放 mask 工作区；旧 `render_frame` 路径由业务显式维护 `BoundedCameraHistory` 并调用 `release_renderer(owner)`。两种方式均需限制下游输出队列。素材历史 stack 默认预算为 512 MiB，当前素材、mask 和输出另计，这不是进程总内存上限。此前 10000 帧观察及未定根因编译异常保留在 [直播运行报告](STREAMING_REVIEW.md)。
 
@@ -26,13 +41,14 @@ perf4.9 复用本帧素材描述和 CPU 参数工作区，并集中上传局部 
 
 | 阅读目的 | 入口 |
 |---|---|
+| 从启动到线上三参数调用、一次性/逐帧参数、退出清理 | [STARTUP_AND_API.md](STARTUP_AND_API.md)、[render_img_example.py](render_img_example.py) |
 | 安装、运行与基线恢复 | 本页下面的步骤 |
 | 三参数入口、逐路配置、共用 mask 羽化 | [RENDER_IMG.md](RENDER_IMG.md)、[paste_renderer.py](paste_renderer.py) |
 | 一帧执行顺序、模块职责、形状与缓存 | [ARCHITECTURE.md](ARCHITECTURE.md) |
 | 矩阵/透明度集中上传、uint8 背景上传与性能证据 | [UPLOAD_OPTIMIZATION_REVIEW.md](UPLOAD_OPTIMIZATION_REVIEW.md) |
 | 本帧素材元数据复用、CPU 参数工作区和 mask 集中上传 | [PREPARATION_OPTIMIZATION_REVIEW.md](PREPARATION_OPTIMIZATION_REVIEW.md) |
 | 统一入口、业务循环与旧接口迁移 | [RENDER_API_REVIEW.md](RENDER_API_REVIEW.md)、[paste_renderer.py](paste_renderer.py) |
-| 可运行直播 worker、帧源/sink 接入与动态阶段 | [LIVE_RENDER_EXAMPLE.md](LIVE_RENDER_EXAMPLE.md)、[live_render_example.py](live_render_example.py) |
+| 旧 render_frame 的直播 worker、帧源/sink 接入与动态阶段 | [LIVE_RENDER_EXAMPLE.md](LIVE_RENDER_EXAMPLE.md)、[live_render_example.py](live_render_example.py) |
 | perf4.5 性能、长期运行与已知限制 | [STREAMING_REVIEW.md](STREAMING_REVIEW.md) |
 | 兼容旧业务辅助函数 | [dynamic_paste_example.py](dynamic_paste_example.py)、[shared_paste_example.py](shared_paste_example.py) |
 | Codex / 开发者修改约束与回归 | [AGENTS.md](AGENTS.md) |
@@ -92,7 +108,7 @@ uv.exe tool run --from ruff==0.14.1 ruff check .
 
 需要自动格式化时，将第一条中的 `--check` 去掉，再执行第二条。未加入 PATH 的 uv 可用 `& '实际路径\uv.exe'` 调用。原工作区也可运行 `.\scripts\lint.ps1` 或 `.\scripts\lint.ps1 -Fix`，但该脚本固定寻找 `..\env\tools\bin\uv.exe`；它不读取 setup 的 `-UvPath` 或 `PASTE_GPU_PYTHON`。
 
-## 运行直播循环示例
+## 运行旧 render_frame 直播循环示例
 
 在仓库根目录运行小画布 GPU 演示，默认 dense 模糊：
 
@@ -176,6 +192,7 @@ perf4.4 筛查覆盖 B=1/4/8/16、4/16/32 个广告位、1～3 种素材尺寸�
 | `scripts/run.ps1 profile-uploads` | `profile_upload_stages.py` | 分开记录 CPU 阶段、CUDA 流区间及实际 GPU kernel/传输活动；用于定位而非吞吐结论 |
 | `scripts/run.ps1 check-uploads` | `check_upload_streaming.py` | 真实样例的工作区复用、动态 B/slot、B0 恢复和旧源码周期对照 |
 | `scripts/run.ps1 check-prepare` | `check_prepare_streaming.py` | 动态路数/slot、逐帧 mask 更新、参数工作区复用、素材切换、暂停恢复与退出清理 |
+| `scripts/run.ps1 render-img-example` | `render_img_example.py` | 新业务三参数入口的有限合成演示：动态路数、素材变化、暂停恢复和退出 |
 | `scripts/run.ps1 check-backends` | `check_backend_contracts.py` | 检查后端覆盖顺序、广播、布局/素材更新和输出所有权 |
 | `scripts/run.ps1 check-policy` | `test_backend_policy.py` | CPU 元数据测试，检查策略精确准入与未知输入回退 |
 | `scripts/run.ps1 compare` | `benchmark_dynamic_comparison.py` | 隔离加载旧源码对照当前完整调用；`--slots` 指定广告位数，默认 16 |

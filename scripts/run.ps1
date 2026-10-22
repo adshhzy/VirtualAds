@@ -1,5 +1,5 @@
 # Deliberately not an advanced script: unknown CLI flags remain in $args.
-param([ValidateSet('shared', 'batch', 'dynamic', 'compare', 'backends', 'render-img-modes', 'uploads', 'prepare', 'profile-uploads', 'check-uploads', 'check-prepare', 'tune', 'check', 'check-backends', 'check-policy', 'check-streaming', 'live-example', 'check-render-img')][string]$Benchmark = 'shared')
+param([ValidateSet('shared', 'batch', 'dynamic', 'compare', 'backends', 'render-img-modes', 'uploads', 'prepare', 'profile-uploads', 'check-uploads', 'check-prepare', 'tune', 'check', 'check-backends', 'check-policy', 'check-streaming', 'live-example', 'render-img-example', 'check-render-img')][string]$Benchmark = 'shared')
 
 $ErrorActionPreference = 'Stop'
 $projectPath = Split-Path -Parent $PSScriptRoot
@@ -28,6 +28,7 @@ $benchmarkFile = switch ($Benchmark) {
     'check-policy' { 'test_backend_policy.py' }
     'check-streaming' { 'check_streaming_stability.py' }
     'live-example' { 'live_render_example.py' }
+    'render-img-example' { 'render_img_example.py' }
     'check-render-img' { 'check_render_img.py' }
 }
 $benchmarkPath = Join-Path $projectPath $benchmarkFile
