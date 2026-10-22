@@ -1,8 +1,9 @@
 # VirtualAds
 
-VirtualAds 是 PyTorch / Triton GPU 广告贴图库和命令行基准程序，没有 Web 服务或浏览器界面。当前版本为 `2026-10-21-perf4.6-render-api`。
+VirtualAds 是 PyTorch / Triton GPU 广告贴图库和命令行基准程序，没有 Web 服务或浏览器界面。当前版本为 `2026-10-22-perf4.7-render-img`。
 
-新业务统一调用 `paste_renderer.render_frame`：worker 初始化一次，每帧由入口完成共享准备与渲染，退出时统一释放。原执行实现迁至 `RenderExecutor`，旧 adapter 名称和调用方式继续兼容。本轮是接口组织调整，未修改 GPU 数学、默认 `batch` 或既有 `auto` 策略，也不宣称性能提升。
+新业务入口为 `ImageRenderer.render_img(data_dict, frame, imgs_raw)`：worker 初始化一次，从 `ad_params_N` 读取各路配置，合成并羽化共用 mask，相机/畸变准备一次后按兼容布局批量渲染。详见 [三参数接口说明](RENDER_IMG.md)。`render_frame` 和旧 adapter 继续兼容；既有贴图数学、默认 `batch` 与 `auto` 策略保持，新增 mask 羽化按要求改变遮挡边缘过渡。
+三参数入口本轮通过 117 项单元回归、1027 次合成调用及 3336 样例配置的 1080p 接线检查；逐路旧入口对照零像素差，mask 独立 Gaussian 参考误差小于 `1e-6`。输入图像/回调为合成数据，验收边界与命令见 [RENDER_IMG.md](RENDER_IMG.md)。
 先读 [代码阅读与修改指南](ARCHITECTURE.md) 和 [统一渲染接口说明](RENDER_API_REVIEW.md)。perf4.5 的性能/长期运行证据保留在 [直播运行报告](STREAMING_REVIEW.md)，不作为本轮新增收益。
 
 统一入口迁移验收时，59 项单元测试及既有 GPU 回归通过；公开入口完成 10000 帧合成长测，42 次旧源码抽查画面与策略一致。完整调用均值在四个 B 档位有升有降，不据此宣称提速；采样范围、内存观察及限制见 [接口验收记录](RENDER_API_REVIEW.md)。
@@ -11,7 +12,7 @@ VirtualAds 是 PyTorch / Triton GPU 广告贴图库和命令行基准程序，�
 
 需要从可运行循环开始接入时，阅读 [直播 worker 示例](LIVE_RENDER_EXAMPLE.md)。它通过 `live-example` 命令演示动态 B、素材 revision、暂停/恢复、无广告及换流清理；演示源与 sink 使用合成数据和本地检查，不包含编码或真实推流。
 
-直播接入可显式使用 `BoundedCameraHistory(capacity=9)`，按单调帧号写入独立相机记录，并给下游输出队列设置容量。素材历史 stack 默认预算为 512 MiB，当前素材工作集与桶打包存储另计，这不是进程总内存上限。worker 退出时调用 `release_renderer(owner)`，业务继续负责历史和输出队列；新入口循环示例见 [统一渲染接口说明](RENDER_API_REVIEW.md)。此前 10000 帧观察及未定根因编译异常保留在 [直播运行报告](STREAMING_REVIEW.md)。
+`ImageRenderer` 自带默认容量 9 的有界相机历史，退出使用 `with` 或 `renderer.close()`，同时释放 mask 工作区；旧 `render_frame` 路径由业务显式维护 `BoundedCameraHistory` 并调用 `release_renderer(owner)`。两种方式均需限制下游输出队列。素材历史 stack 默认预算为 512 MiB，当前素材、mask 和输出另计，这不是进程总内存上限。此前 10000 帧观察及未定根因编译异常保留在 [直播运行报告](STREAMING_REVIEW.md)。
 
 格式与静态检查使用 Ruff 0.14.1，运行于独立 uv 工具环境；新克隆的通用命令见下文，不改 GPU 依赖。
 
@@ -22,6 +23,7 @@ VirtualAds 是 PyTorch / Triton GPU 广告贴图库和命令行基准程序，�
 | 阅读目的 | 入口 |
 |---|---|
 | 安装、运行与基线恢复 | 本页下面的步骤 |
+| 三参数入口、逐路配置、共用 mask 羽化 | [RENDER_IMG.md](RENDER_IMG.md)、[paste_renderer.py](paste_renderer.py) |
 | 一帧执行顺序、模块职责、形状与缓存 | [ARCHITECTURE.md](ARCHITECTURE.md) |
 | 统一入口、业务循环与旧接口迁移 | [RENDER_API_REVIEW.md](RENDER_API_REVIEW.md)、[paste_renderer.py](paste_renderer.py) |
 | 可运行直播 worker、帧源/sink 接入与动态阶段 | [LIVE_RENDER_EXAMPLE.md](LIVE_RENDER_EXAMPLE.md)、[live_render_example.py](live_render_example.py) |
@@ -187,7 +189,7 @@ perf4.4 筛查覆盖 B=1/4/8/16、4/16/32 个广告位、1～3 种素材尺寸�
 
 ## 接入与迭代约束
 
-生产接入以 `paste_renderer` 为主入口。保留业务原有的布局、通道、alpha、缩放等选项，在 worker 内调用一次 `initialize_renderer`；每帧调用 `render_frame`，由它选择当前 way 的广告位、完成一次共享准备并交给执行器。业务不必手动拼接 `paste_args`：
+新的三参数接入和暂停/关闭规则见 [RENDER_IMG.md](RENDER_IMG.md)。以下为兼容 `render_frame` 的底层接入示例：保留业务原有的布局、通道、alpha、缩放等选项，在 worker 内调用一次 `initialize_renderer`；每帧调用 `render_frame`，由它选择当前 way 的广告位、完成一次共享准备并交给执行器。
 
 ```python
 from paste_renderer import initialize_renderer, render_frame, release_renderer

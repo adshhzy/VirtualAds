@@ -2,26 +2,28 @@
 
 ## 项目与运行
 
-- VirtualAds 是 Python GPU 库和命令行基准，没有 Web 服务。当前版本 `2026-10-21-perf4.6-render-api`，本轮对照基线 `4b2b311`。原包 perf4.1 基线为 `0b97beb`；最初 perf4 为 `480fad5`。本轮统一业务入口与执行器职责，不改 GPU 数学、batch 默认或 auto 表，也不宣称性能提升；接口与验收状态见 `RENDER_API_REVIEW.md`。
+- VirtualAds 是 Python GPU 库和命令行基准，没有 Web 服务。当前版本 `2026-10-22-perf4.7-render-img`，三参数接口说明见 `RENDER_IMG.md`；旧统一入口迁移基线 `4b2b311` 和验收见 `RENDER_API_REVIEW.md`。原包 perf4.1 基线为 `0b97beb`；最初 perf4 为 `480fad5`。保持 batch 默认与 auto 表；本轮新增 mask 羽化会改变遮挡边缘过渡。
 - 先尊重调用方的 `PASTE_GPU_PYTHON`；未设置时使用 `scripts/run.ps1` 的默认解释器，即仓库父目录下 `env\paste_gpu_performance\Scripts\python.exe`。不要在新机器上硬编码旧 E 盘路径；不要直接用系统 Python 运行项目，也不要改动其他项目环境。若环境不存在，按 README 创建。
 - 当前 Windows 锁文件要求现有 Python 3.12 与 uv。`scripts/setup.ps1 -PythonPath ... -UvPath ...` 创建项目环境并安装 `requirements-lock.txt`，不会下载/安装 Python 或 uv；torch 独立使用官方 cu128 源。自定义 `-EnvironmentPath` 后相应设置 `PASTE_GPU_PYTHON`。依赖调整应同步锁文件并验证 CUDA / Triton 兼容。
 - 本机已测参考：Windows、RTX 4090、Python 3.12.14、PyTorch 2.9.1+cu128；当时解释器为 `E:\dev\virtualAds\env\paste_gpu_performance\Scripts\python.exe`。此路径是历史记录，不是所有克隆的固定入口。
 - `scripts/run.ps1 shared ...` 对应 `benchmark_shared_paste.py`；`scripts/run.ps1 batch ...` 对应 `benchmark_paste_gpu_batch.py`。
 - `scripts/run.ps1 backends ...` 对应 `benchmark_backend_comparison.py`；`before_bucketed` 候选配合 `--baseline` 在同进程隔离比较旧桶、当前桶和 batch，`--require-exact` 指定必须零差异的候选。`check-backends` 对应 `check_backend_contracts.py`；`check-policy` 对应 CPU 元数据测试 `test_backend_policy.py`。旧 batch 源码对照仍用 `compare` / `benchmark_dynamic_comparison.py`，`--slots` 为单个正整数，默认 16。
 - `scripts/run.ps1 check-streaming` 对应 `check_streaming_stability.py`，需要 `--baseline` 指向保留源码；`--frames` 是固定/动态两阶段合计测量帧数，不含预热。新克隆先按 README 的 `git archive`/`Expand-Archive` 步骤恢复 `6edf109`；旧桶基线为 `9c6e930`。禁止为恢复基线覆盖或删除已有 results。运行示例与内存指标边界见 `STREAMING_REVIEW.md`。
-- 新业务入口为 `paste_renderer.initialize_renderer` / `render_frame` / `release_renderer`；`paste_render_executor.py` 的 `RenderOptions` / `RenderExecutor` 是规范实现。`paste_gpu_batch_adapter.py` 只保留旧导入/函数兼容，勿再复制一份执行逻辑。共享参数在 `paste_shared_params.py` / `paste_camera_filter.py`，纯 Tensor 路由在 `paste_gpu_batch.py`，GPU 内核在 `paste_*_kernels.py`。
+- 底层兼容入口为 `paste_renderer.initialize_renderer` / `render_frame` / `release_renderer`；`paste_render_executor.py` 的 `RenderOptions` / `RenderExecutor` 是规范实现。`paste_gpu_batch_adapter.py` 只保留旧导入/函数兼容，勿再复制一份执行逻辑。共享参数在 `paste_shared_params.py` / `paste_camera_filter.py`，纯 Tensor 路由在 `paste_gpu_batch.py`，GPU 内核在 `paste_*_kernels.py`。
+- 三参数业务入口是 `ImageRenderer.render_img(data_dict, frame, imgs_raw)`，初始化一次的对象显式持有状态，无模块全局 worker。`paste_route_plan.py` 按整数路号扫描 ad_params_N，精确pair查imgs_raw，按有序bbox/素材尺寸等兼容条件分组；不读ad_paste_data/way_ad_map/brightness/image_path，不用透明占位slot伪造相同布局。旧render_frame继续兼容。
+- `paste_shared_mask.py` / `paste_mask_kernels.py` 先maximum合并局部mask再做全帧Gaussian羽化，mask=1保留背景；默认sigma1.5/radius3，replicate边界，radius0关闭。借用工作区必须在下一帧前消费，不能当独立输出保存。相机/mask/背景上传每帧共用，不按路重复；最终NumPy仍独立。
 - 可运行业务循环在 `live_render_example.py`，演示源/合成回调/检查 sink 在 `live_render_demo.py`；`scripts/run.ps1 live-example --device cuda:0` 为小画布演示，默认 dense，可显式 `--separable` 检查已知演示核。接入字段、source/sink 生命周期见 `LIVE_RENDER_EXAMPLE.md`；不把演示 Synthetic 回调用于生产，也不把本地 sink 称为实际编码/推流。
 - `paste_asset_cache.py` 负责历史素材 stack 的预算/LRU/revision；当前素材与源身份引用由执行器持有。优先阅读 `README.md`、`ARCHITECTURE.md` 和 `RENDER_API_REVIEW.md`；`STREAMING_REVIEW.md`、`BUCKETED_OPTIMIZATION_REVIEW.md` 等为历史记录，不能重写旧结果或据旧文档扩大当前策略范围。results/logs/env/缓存不随 Git 分发；报告中的原始测试 artifact 不在新克隆内，恢复源码不能恢复旧测量数据。
 - 新克隆用已有 uv 执行 `uv.exe tool run --from ruff==0.14.1 ruff format --check .` 和 `uv.exe tool run --from ruff==0.14.1 ruff check .`。`scripts/lint.ps1` 仅适用于已有 `..\env\tools\bin\uv.exe` 的工作区，不读取 setup 的 `-UvPath`；`-Fix` 仅统一格式再检查。Ruff 0.14.1/100列/LF/Python3.9语法目标，配置在 `pyproject.toml`，工具隔离于GPU环境。保留平铺导入路径；优先按阶段职责放置 helper，不引入只为包装参数的层层对象。
 
 ## 必须保持的行为
 
-- `AdapterOptions is RenderOptions`、`PasteBatchAdapter is RenderExecutor`：旧名称必须保持同一个 class，不能改成子类或额外包装实例。旧函数、`__call__`、共享准备和动态示例函数签名/返回值继续兼容；新业务用 `render_frame`，已有手工准备流程仍可运行。
+- `AdapterOptions is RenderOptions`、`PasteBatchAdapter is RenderExecutor`：旧名称必须保持同一个 class，不能改成子类或额外包装实例。旧函数、`__call__`、共享准备和动态示例函数签名/返回值继续兼容；三参数业务用 `ImageRenderer.render_img`，已有 `render_frame` 和手工准备流程仍可运行。
 - 统一入口应调用 `executor(...)`，标准类再转调 `render_prepared`；不得直接绕过旧业务子类的 `__call__` 覆盖。
 - 旧 adapter 模块是兼容 shim，helper 属性读取可代理，但给旧模块私有全局赋值不会转发。需注入测试依赖时定位实际实现模块 `paste_render_executor`，不要另复制执行代码或把私有 monkeypatch 当作业务 API。
 - owner 的 `_paste_batch_adapter` / `_shared_paste_builder` 是唯一执行器/builder 存储位，不能另增一套缓存。每帧共享准备一次，ROI 网格仍待实际素材尺寸明确后通过 builder 回调产生。无广告绕过共享准备；`ad_params_{way_id}` 的非 None 值优先。
 - 新 `render_frame` 的 `material_groups=None` / `camera_history=None` 意味着沿用 owner 已有字段；显式空组拒绝。旧动态 wrapper 的必要参数和显式 None 行为继续兼容，不可顺手改成新 API 的默认语义。
-- 初始化在 worker 内调用一次；退出用 `release_renderer(owner)`，释放后原实例仍可重用。真实业务回调、独立 NumPy、调用方历史及有界输出队列的所有权保持不变。
+- 初始化在 worker 内调用一次；ImageRenderer退出用with/close，可复用释放用其release_resources，包含mask工作区和owner当前素材引用。兼容render_frame才直接用release_renderer(owner)，它只清执行器/shared builder、不清新类mask/历史。真实业务回调、独立NumPy及有界输出队列所有权保持。
 - 直播示例中 B=0 是调度暂停，无广告是 B 张背景返回；连续暂停只在进入暂停时释放，恢复复用实例。换流/seek 显式清历史并重置帧号，PTS 按下游时间线管理；同步 sink 在 close 返回前完成消费。异步 sink 必须限制队列并在退出时排空/取消，单路 NumPy view 仍可能保留整个批次存储。
 - `run_live_worker` 的 source→sink→renderer→worker 输入清理顺序、初始化失败/close异常时的后续清理须保持。sink 调用异常时用 finally 删除 worker 的 output 引用；异常 traceback 仍可持有 sink 参数或源帧，不能把清理单测解释为所有外部引用释放，上层也不能无界保存异常对象。
 - 默认保持 `normalization="legacy"`、`camera_index_policy="legacy"`；性能修改不要同时混入 `matched` / `corrected` 的画面行为变更。
@@ -39,7 +41,7 @@
 - 历史素材 stack 受 `max_cached_bytes`（默认 512 MiB）、尺寸数和条目数共同约束；当前完整素材工作集另计，可大于预算。revision 精确变化必须清旧代；历史条目和当前工作集须保留 source 强引用，不能用裸 `id` 替代所有权。预算不含 source storage、桶打包、LUT、输出或分配器保留量。
 - 图像/map 计划缓存只允许有限 CPU 元数据，不保留动态像素/透明度/mask。每帧仍校验实时输入形状、成员与布局，并应用当前 Tensor；不能以相同 frame_id、shape 或对象 id 跳过值变化。输入准备阶段的局部校验与直接 core 的公开校验都须保留完整契约。
 - `_warp_paste_into_supported` 只供已经完成支持/padding 检查的内部路径使用；公开 `warp_paste_into` 仍须拒绝不支持的输入。删除重复 host 检查不能改变 launch 或 GPU 数学。
-- `BoundedCameraHistory` 必须由业务显式接入，按单调 frame ID 添加真实独立状态，seek 时 reset。只有该类型走直接窗口 lookup；普通 Mapping 保留全部 key 校验与原行为，不自动裁剪外部历史。
+- 兼容render_frame的`BoundedCameraHistory`由业务显式接入；ImageRenderer自行创建有界历史并复制每帧CPU相机状态。按单调frame ID更新，seek用renderer.reset_history清历史和工作集。只有此容器走直接窗口lookup，普通Mapping保留原行为、不裁剪外部历史。
 - builder/adapter 的 `release_resources()` 在调用之间或退出时释放库持有资源；返回的独立 NumPy 仍由调用方拥有，不能复用覆盖其存储。业务输入、历史和下游队列也须有明确上限/释放时机。不得用逐帧 `gc.collect()`、`empty_cache()` 或全局同步掩盖资源问题，也不能把 `reserved` 直接解释为泄漏。
 
 ## 回归与性能证据
@@ -65,6 +67,8 @@ $projectPython = (Resolve-Path -LiteralPath $pythonCandidate -ErrorAction Stop).
 & $projectPython -m unittest test_streaming_history test_streaming_lifecycle test_adapter_preparation test_core_guards test_backend_policy
 & $projectPython -B -m unittest test_render_api
 & $projectPython -B -m unittest test_live_render_example
+& $projectPython -B -m unittest test_route_plan test_shared_mask test_render_img
+.\scripts\run.ps1 check-render-img --device cuda:0 --frames 1000 --output results/render_img_check.json
 .\scripts\run.ps1 check-streaming --device cuda:0 --entry-point render_frame --baseline results/baseline_render_api_4b2b311 --baseline-label 4b2b311 --frames 10000 --warmup 200 --sample-every 100 --check-every 250 --revision-every 1 --retain-outputs 3 --output results/render_api_streaming_final_10000.json
 ```
 

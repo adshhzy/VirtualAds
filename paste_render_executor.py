@@ -139,7 +139,7 @@ else:
     from paste_asset_cache import SizeAssetCache as _SizeAssetCache, tensor_bytes
 
 
-RENDERER_VERSION = "2026-10-21-perf4.6-render-api"
+RENDERER_VERSION = "2026-10-22-perf4.7-render-img"
 
 
 @dataclass(frozen=True)
