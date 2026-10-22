@@ -22,7 +22,8 @@ if __package__:
     )
     from .paste_shared_params import SharedParameterBuilder
     from .paste_shared_mask import SharedMaskBuilder
-    from .paste_route_plan import build_route_plan
+    from .paste_route_plan import build_route_plan, _build_route_plan
+    from .paste_route_preparation import PreparedRouteData, RoutePreparationWorkspace
     from .paste_frame_upload import FrameUploadBuffer
 else:
     from paste_camera_filter import BoundedCameraHistory as BoundedCameraHistory
@@ -34,8 +35,14 @@ else:
     )
     from paste_shared_params import SharedParameterBuilder
     from paste_shared_mask import SharedMaskBuilder
-    from paste_route_plan import build_route_plan
+    from paste_route_plan import build_route_plan, _build_route_plan
+    from paste_route_preparation import PreparedRouteData, RoutePreparationWorkspace
     from paste_frame_upload import FrameUploadBuffer
+
+
+_STANDARD_EXECUTOR_CALL = RenderExecutor.__call__
+_STANDARD_RENDER_PREPARED = RenderExecutor.render_prepared
+_STANDARD_WARP_CALLBACK = SharedParameterBuilder.build_warp_grids
 
 
 def initialize_renderer(
@@ -236,6 +243,8 @@ class ImageRenderer:
         self.history = BoundedCameraHistory(capacity=history_capacity)
         self.mask_builder = SharedMaskBuilder(sigma=mask_sigma, radius=mask_radius)
         self._frame_upload = FrameUploadBuffer()
+        self._route_preparation = RoutePreparationWorkspace()
+        self._use_prepared_route_inputs = True
         # The mask is built here in normalized HW form, irrespective of legacy
         # external mask conventions. Image/alpha/sampling options stay intact.
         options = replace(
@@ -278,6 +287,21 @@ class ImageRenderer:
         # dictionary nor the history record is used as its mutable work dictionary.
         return {"K": record["K"], "dist_coeffs": record["dist_coeffs"].copy()}
 
+    def _can_prepare_routes(self):
+        """Keep custom executor/warp hooks on the public, independently owned plan."""
+        executor = self.executor
+        builder = getattr(self.owner, "_shared_paste_builder", None)
+        callback = executor.options.warp_grids_builder
+        return (
+            self._use_prepared_route_inputs
+            and type(executor) is RenderExecutor
+            and type(executor).__call__ is _STANDARD_EXECUTOR_CALL
+            and getattr(executor.render_prepared, "__func__", None) is _STANDARD_RENDER_PREPARED
+            and type(builder) is SharedParameterBuilder
+            and getattr(callback, "__self__", None) is builder
+            and getattr(callback, "__func__", None) is _STANDARD_WARP_CALLBACK
+        )
+
     @torch.inference_mode()
     def render_img(self, data_dict, frame, imgs_raw):
         """Return ready NumPy uint8: HWC for B1, BHWC for B>1, (0,H,W,3) for B0.
@@ -296,7 +320,14 @@ class ImageRenderer:
         if frame_plan[1][0] != 1:
             raise ValueError("render_img expects one original frame, not a frame batch")
         height, width = frame_plan[1][-2:]
-        plan = build_route_plan(data_dict, imgs_raw, (height, width), self.executor.options)
+        prepared = self._can_prepare_routes()
+        if prepared:
+            plan = _build_route_plan(
+                data_dict, imgs_raw, (height, width), self.executor.options, self._route_preparation
+            )
+        else:
+            self._route_preparation.release_resources()
+            plan = build_route_plan(data_dict, imgs_raw, (height, width), self.executor.options)
         has_ads = any(group.params for group in plan.groups)
         camera = self._camera_inputs(data_dict, required=has_ads)
         self.route_ids = plan.route_ids
@@ -331,6 +362,15 @@ class ImageRenderer:
             # no longer needs the previous advertising frame's upload workspace.
             self._frame_upload.release_resources()
 
+        # Shared business callbacks may install a custom executor/warp hook.
+        # Preserve the pre-callback parameter snapshot without exposing borrowed
+        # workspace to that hook. B1 original matrices/maps remain original refs.
+        if prepared and not self._can_prepare_routes():
+            for group in plan.groups:
+                for param, name in group.borrowed_parameters:
+                    param[name] = param[name].copy()
+            prepared = False
+
         # Most traffic has one compatible layout and returns the executor's
         # original independent output directly. Mixed layouts need one final
         # NumPy batch, with each group copied back into numeric route order.
@@ -342,9 +382,12 @@ class ImageRenderer:
             self.owner.imgs_raw_groups = group.material_groups
             # Generated data has only the selected ordered slots; no legacy way
             # key can override it. Per-route geometry remains live in the plan.
-            output = self.executor(
-                self.owner, shared_frame, {"ad_params": group.params}, frame_id, 1, shared
+            frame_data = (
+                PreparedRouteData(group.params, group.sources)
+                if prepared
+                else {"ad_params": group.params}
             )
+            output = self.executor(self.owner, shared_frame, frame_data, frame_id, 1, shared)
             decisions.append(dict(self.executor.last_execution))
             if assembled is None:
                 self.last_execution = tuple(decisions)
@@ -377,6 +420,7 @@ class ImageRenderer:
                 try:
                     self._frame_upload.release_resources()
                 finally:
+                    self._route_preparation.release_resources()
                     self.owner.imgs_raw_groups = []
                     self._active = False
                     self.last_execution = ()

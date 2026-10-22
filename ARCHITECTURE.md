@@ -1,6 +1,6 @@
 # 代码阅读与修改指南
 
-当前版本 `2026-10-22-perf4.8-uploads`。这是 GPU 贴图库和基准工具，不含视频解码、编码、推流或常驻服务。
+当前版本 `2026-10-23-perf4.9-prepare`。这是 GPU 贴图库和基准工具，不含视频解码、编码、推流或常驻服务。
 三参数入口的路数由 `ad_params_N` 决定；每路可以有独立广告列表，但共用原始帧和相机。底层每次 batch 的 B 是其中**兼容布局组的路数**，不等于独立摄像机并发数。
 三参数接口、共用 mask 羽化和本轮验收见 [RENDER_IMG.md](RENDER_IMG.md)。原贴图数学和策略表保持，新增羽化改变遮挡边缘过渡。[RENDER_API_REVIEW.md](RENDER_API_REVIEW.md) 保留上轮入口迁移结果，[STREAMING_REVIEW.md](STREAMING_REVIEW.md) 保留 perf4.5 生命周期和测量结果。
 
@@ -40,6 +40,7 @@ flowchart TD
 |---|---|---|
 | `paste_renderer.py` | 统一初始化、每帧共享准备和整体释放 | 新业务调用边界与 owner 接入 |
 | `paste_route_plan.py` | 从 ad_params_N 和精确素材 key 规划兼容布局组 | 路号排序、独立配置与 batch 对应 |
+| `paste_route_preparation.py` | 本次调用的素材描述和有界 CPU 参数工作区 | 消除重复解析、借用参数的内部生命周期与旧接口回退 |
 | `paste_frame_upload.py` | 连续 CPU uint8 背景的字节上传和 GPU float32 转换 | 共用背景工作区、输入类型回退 |
 | `paste_upload_buffer.py` | 有界固定页 staging 和目标 GPU 空间复用 | H2D 在途保护、容量/设备/流生命周期 |
 | `paste_shared_mask.py` / `paste_mask_kernels.py` | 最大值合并局部 mask、整图 Gaussian 羽化、持久工作区 | 保护 mask 的边界和资源管理 |
@@ -63,6 +64,10 @@ owner 上仍使用 `_paste_batch_adapter` 和 `_shared_paste_builder` 两个兼�
 三参数入口对连续 CPU uint8 背景先上传字节，再在 GPU 转 float32；每帧所有布局组共用一次上传。CPU 的各 slot `[3,3]` / `[1|B,3,3]` 矩阵集中传一次，float32 标量/向量透明度另集中传一次。每帧填入当前值，复用的是存储而不是几何结果。空间透明度、其他 dtype 或 GPU 输入保留原转换路径；旧 `render_frame` 的背景路径保持原样。
 
 上传工作区只持有一个当前设备/类型上下文，容量有界增长，不按路数或 shape 永久积累多份。重写固定页 staging 前等待上一次 H2D 事件，GPU 借用视图按同一计算流顺序消费；跨流复用须先释放并由调用方建立依赖。返回的 NumPy 仍使用独立输出存储。预算、诊断字段和测试证据见 [上传优化报告](UPLOAD_OPTIMIZATION_REVIEW.md)。
+
+标准三参数流程还会传递本帧已验证的素材描述，避免执行器再解析一遍虚拟素材字典；同帧内重复形状复用布局描述。常见同 dtype 的 CPU float32/float64 矩阵与标量透明度写入有界普通 CPU 工作区，再交给原上传缓冲区。数值每帧重写，未缓存几何结果。公共 route plan 和自定义执行入口保留独立参数所有权。
+
+可见 CPU mask 小块集中转换为 float32 后上传，再按原顺序 clamp、maximum 合并和全图羽化。GPU/混合来源及特殊逻辑 Tensor 视图保留逐块路径；mask 数值仍逐帧检查和读取。分项比较、工作区预算及兼容边界见 [准备阶段优化报告](PREPARATION_OPTIMIZATION_REVIEW.md)。
 
 ## 一帧如何走完
 

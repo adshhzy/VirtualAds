@@ -20,6 +20,11 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+if __package__:
+    from .paste_upload_buffer import PinnedUploadBuffer
+else:
+    from paste_upload_buffer import PinnedUploadBuffer
+
 
 def _integer(value, name, *, minimum=None):
     if isinstance(value, (bool, np.bool_)) or not isinstance(value, Integral):
@@ -88,6 +93,11 @@ class SharedMaskBuilder:
         for value in self._weight_values:
             weight_sum = np.float32(weight_sum + np.float32(value))
         self._weight_sum = float(weight_sum)
+        # Capacity follows visible patch area, never the frame or past layouts.
+        # The budget applies separately to pinned host and device allocations;
+        # larger requests use temporary working storage, not a larger cache.
+        self._patch_upload = PinnedUploadBuffer(max_cached_bytes=32 * 1024 * 1024)
+        self._batch_upload_enabled = True  # Private benchmark ablation hook.
         self.release_resources()
 
     @property
@@ -107,8 +117,10 @@ class SharedMaskBuilder:
 
         Call between builds, after its last consumer has finished. Caller-held
         borrowed tensors still own their old storage; release cannot revoke them.
-        No CUDA synchronization, empty_cache or garbage collection is performed.
+        Wait only for this builder's pending H2D read before releasing its pinned
+        source. No global CUDA synchronization, empty_cache or GC is performed.
         """
+        self._patch_upload.release_resources()
         self._device = self._shape = None
         self._canvas = self._temporary = self._output = self._patch = self._weights = None
         self._builds = self._workspace_allocations = self._kernel_uploads = 0
@@ -134,6 +146,8 @@ class SharedMaskBuilder:
             "workspace_allocations": self._workspace_allocations,
             "kernel_uploads": self._kernel_uploads,
             "effective_backend": self._last_backend,
+            # Separate from the historical canvas/scratch workspace accounting.
+            "patch_upload": self._patch_upload.cache_info(),
         }
 
     def _describe_masks(self, items, height, width, device):
@@ -180,6 +194,8 @@ class SharedMaskBuilder:
 
     def _ensure_workspace(self, height, width, device):
         changed_device = device != self._device
+        if changed_device:
+            self._patch_upload.release_resources()
         weights = self._weights
         if changed_device or weights is None:
             weights = self._host_weights.to(device=device)
@@ -200,6 +216,49 @@ class SharedMaskBuilder:
             self._weights = weights
             self._kernel_uploads += 1
         self._device = device
+
+    def _upload_host_patches(self, patches, device):
+        """Pack validated visible CPU pixels once; return a borrowed flat tensor.
+
+        Mixed/GPU sources retain the original copy path. All input values are
+        read on every build: this workspace caches storage, never mask content.
+        prepare() protects the prior H2D source before any host view is written.
+        """
+        if (
+            not self._batch_upload_enabled
+            or device.type != "cuda"
+            or not patches
+            or any(
+                isinstance(source, torch.Tensor)
+                and (source.device.type != "cpu" or source.is_neg() or source.is_conj())
+                for _, source in patches
+            )
+        ):
+            # An oversized pending host copy is a temporary working set, not
+            # retained cache. Retire it even if later frames have no CPU masks.
+            if self._patch_upload._temporary:
+                self._patch_upload.release_resources()
+            return None
+        count = sum((bottom - top) * (right - left) for (left, top, right, bottom), _ in patches)
+        host = self._patch_upload.prepare((count,), dtype=torch.float32, device=device)
+        host_array = host.numpy()
+        offset = 0
+        for (left, top, right, bottom), source in patches:
+            shape = bottom - top, right - left
+            size = shape[0] * shape[1]
+            if isinstance(source, np.ndarray):
+                # np.copyto handles read-only/negative-stride/non-native arrays
+                # directly, without the extra contiguous copy needed by torch.
+                np.copyto(
+                    host_array[offset : offset + size].reshape(shape), source, casting="unsafe"
+                )
+            else:
+                # CPU copy_ also supports bfloat16 without a numpy conversion.
+                # Logical negative/conjugate views retain the original device
+                # copy path: CPU staging may resolve their bits differently.
+                host[offset : offset + size].view(shape).copy_(source)
+            offset += size
+        return self._patch_upload.upload()
 
     def _blur_eager(self):
         """Accumulate the same ordered taps without an opaque convolution reduction."""
@@ -244,9 +303,18 @@ class SharedMaskBuilder:
                 kernels = candidate
             elif self.acceleration == "triton":
                 raise RuntimeError("acceleration='triton' requires available Triton mask kernels")
+        uploaded = self._upload_host_patches(patches, device)
         self._canvas.zero_()
+        offset = 0
         for (left, top, right, bottom), source in patches:
-            if isinstance(source, np.ndarray):
+            shape = bottom - top, right - left
+            size = shape[0] * shape[1]
+            if uploaded is not None:
+                # This private staging owns its values. Clamp in place without
+                # copying each slice back through the older per-patch scratch.
+                patch = uploaded[offset : offset + size].view(shape)
+                offset += size
+            elif isinstance(source, np.ndarray):
                 # Convert one visible patch at a time. Negative strides or a
                 # read-only array need a bounded host copy; off-frame pixels
                 # never enlarge this scratch. Common uint8/float32 inputs are
@@ -261,8 +329,9 @@ class SharedMaskBuilder:
                 except (TypeError, ValueError):
                     source = torch.from_numpy(np.ascontiguousarray(source_array, dtype=np.float32))
                 del source_array
-            patch = self._patch[: (bottom - top) * (right - left)].view(bottom - top, right - left)
-            patch.copy_(source)
+            if uploaded is None:
+                patch = self._patch[:size].view(shape)
+                patch.copy_(source)
             patch.clamp_(0, 1)
             region = self._canvas[top:bottom, left:right]
             torch.maximum(region, patch, out=region)

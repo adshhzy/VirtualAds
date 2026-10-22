@@ -166,13 +166,21 @@ def install_hooks(hooks, worker, prefix):
         )
     }
     api, execution = modules["paste_renderer"], modules["paste_render_executor"]
+    # The three-argument entry point may use its private borrowed-input planner;
+    # hook that actual call, without wrapping callbacks that gate its fast path.
     hooks.add(api, "build_route_plan", "route_plan", False)
+    if hasattr(api, "_build_route_plan"):
+        # Public planning calls its own module's helper, not this imported alias,
+        # so these two wrappers measure mutually exclusive renderer branches.
+        hooks.add(api, "_build_route_plan", "route_plan", False)
     hooks.add(worker, "_camera_inputs", "camera_snapshot", False)
     if hasattr(worker, "_frame_upload"):
         hooks.add(worker._frame_upload, "prepare", "frame_upload")
     else:
         hooks.add(api, "_as_tensor", "frame_upload")
     hooks.add(worker.mask_builder, "build", "shared_mask")
+    if hasattr(worker.mask_builder, "_upload_host_patches"):
+        hooks.add(worker.mask_builder, "_upload_host_patches", "mask_upload")
     hooks.add(modules["paste_mask_kernels"], "gaussian_mask_into", "mask_feather")
     hooks.add(api, "_prepare_shared_parameters", "shared_parameters")
     hooks.add(
@@ -317,6 +325,9 @@ def main():
         report["shared_info"] = worker.owner._shared_paste_builder.last_info
         report["assets"] = worker.executor.cache_info()
         report["shared_cache"] = worker.owner._shared_paste_builder.cache_info()
+        report["mask_workspace"] = worker.mask_builder.cache_info()
+        if hasattr(worker, "_route_preparation"):
+            report["route_workspace"] = worker._route_preparation.cache_info()
         if hasattr(worker, "_frame_upload"):
             report["frame_upload"] = worker._frame_upload.cache_info()
         report["phase_endpoint_pixel_exact"] = True

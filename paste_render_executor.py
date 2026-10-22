@@ -122,6 +122,7 @@ if __package__:
     from . import paste_execution_policy as execution_policy
     from .paste_shared_types import MotionKernelSpec
     from .paste_upload_buffer import PinnedUploadBuffer
+    from .paste_route_preparation import PreparedRouteData
 else:
     from paste_gpu_batch import (
         homography_roi_grid,
@@ -135,6 +136,7 @@ else:
     import paste_execution_policy as execution_policy
     from paste_shared_types import MotionKernelSpec
     from paste_upload_buffer import PinnedUploadBuffer
+    from paste_route_preparation import PreparedRouteData
 
 if __package__:
     from .paste_asset_cache import SizeAssetCache as _SizeAssetCache, tensor_bytes
@@ -142,7 +144,7 @@ else:
     from paste_asset_cache import SizeAssetCache as _SizeAssetCache, tensor_bytes
 
 
-RENDERER_VERSION = "2026-10-22-perf4.8-uploads"
+RENDERER_VERSION = "2026-10-23-perf4.9-prepare"
 
 
 @dataclass(frozen=True)
@@ -610,13 +612,20 @@ class RenderExecutor:
             raise ValueError("owner.device cannot be an empty device collection")
         return (int(way_id) - 1) % count
 
-    def _collect_ads(self, owner, groups, params, device, image_index):
+    def _collect_ads(self, owner, groups, params, device, image_index, *, prepared_sources=None):
         """Return one cached [B, 4, H, W] tensor per slot in the current order.
 
         Cache keys include ordered member identities and the caller's asset
         revision. Geometry is deliberately excluded: it is prepared live later.
         """
-        sources, signature, slot_signatures = self._describe_ad_sources(groups, params, image_index)
+        described = (
+            prepared_sources.consume(groups, params, self.options, image_index)
+            if prepared_sources is not None
+            else None
+        )
+        if described is None:
+            described = self._describe_ad_sources(groups, params, image_index)
+        sources, signature, slot_signatures = described
         opt = self.options
         revision = getattr(owner, "imgs_raw_version", 0)
         cache_enabled = opt.cache_ads and revision is not None
@@ -1326,7 +1335,13 @@ class RenderExecutor:
             boxes = tuple(
                 _bbox(param["bbox"], hw, f"ad_params[{i}].bbox") for i, param in enumerate(params)
             )
-            ads = self._collect_ads(owner, groups, params, device, self._image_index(owner, way_id))
+            image_index = self._image_index(owner, way_id)
+            if isinstance(data_dict, PreparedRouteData):
+                ads = self._collect_ads(
+                    owner, groups, params, device, image_index, prepared_sources=data_dict.sources
+                )
+            else:
+                ads = self._collect_ads(owner, groups, params, device, image_index)
             grids, opacity = self._prepare_warp_inputs(
                 params, ads, boxes, grid_dict, device, batch, opt
             )

@@ -1,10 +1,13 @@
 # VirtualAds
 
-VirtualAds 是 PyTorch / Triton GPU 广告贴图库和命令行基准程序，没有 Web 服务或浏览器界面。当前版本为 `2026-10-22-perf4.8-uploads`。
+VirtualAds 是 PyTorch / Triton GPU 广告贴图库和命令行基准程序，没有 Web 服务或浏览器界面。当前版本为 `2026-10-23-perf4.9-prepare`。
 
 新业务入口为 `ImageRenderer.render_img(data_dict, frame, imgs_raw)`：worker 初始化一次，从 `ad_params_N` 读取各路配置，合成并羽化共用 mask，相机/畸变准备一次后按兼容布局批量渲染。详见 [三参数接口说明](RENDER_IMG.md)。`render_frame` 和旧 adapter 继续兼容；既有贴图数学、默认 `batch` 与 `auto` 策略保持，新增 mask 羽化按要求改变遮挡边缘过渡。
 perf4.7 三参数入口验收通过 117 项单元回归、1027 次合成调用及 3336 样例配置的 1080p 接线检查；逐路旧入口对照零像素差，mask 独立 Gaussian 参考误差小于 `1e-6`。该轮输入图像/回调为合成数据，验收边界与命令见 [RENDER_IMG.md](RENDER_IMG.md)。
 perf4.8 集中上传矩阵/透明度，并将连续 CPU uint8 背景的 float32 转换移到 GPU。真实 3336 输入的 B8/S16 固定/动态 bbox 完整调用平均耗时分别下降 17.75% / 8.94%，全部计时帧与旧源码逐像素一致；另完成 10,000 帧工作区复用检查，测量边界和内存成本见 [上传优化报告](UPLOAD_OPTIMIZATION_REVIEW.md)。
+
+perf4.9 复用本帧素材描述和 CPU 参数工作区，并集中上传局部 CPU mask。同一 3336 样例下，相对 perf4.8 的固定/动态 bbox 完整调用均值降至 8.745 / 8.907 ms，分别下降 26.98% / 26.96%。四候选共 7,680 次计时调用全部逐像素一致，另完成 10,000 帧固定/动态工作区复用检查；默认 auto 不变。分项收益、分阶段测量及内存成本见 [准备阶段优化报告](PREPARATION_OPTIMIZATION_REVIEW.md)。
+
 先读 [代码阅读与修改指南](ARCHITECTURE.md) 和 [统一渲染接口说明](RENDER_API_REVIEW.md)。perf4.5 的性能/长期运行证据保留在 [直播运行报告](STREAMING_REVIEW.md)，不作为本轮新增收益。
 
 统一入口迁移验收时，59 项单元测试及既有 GPU 回归通过；公开入口完成 10000 帧合成长测，42 次旧源码抽查画面与策略一致。完整调用均值在四个 B 档位有升有降，不据此宣称提速；采样范围、内存观察及限制见 [接口验收记录](RENDER_API_REVIEW.md)。
@@ -27,6 +30,7 @@ perf4.8 集中上传矩阵/透明度，并将连续 CPU uint8 背景的 float32 
 | 三参数入口、逐路配置、共用 mask 羽化 | [RENDER_IMG.md](RENDER_IMG.md)、[paste_renderer.py](paste_renderer.py) |
 | 一帧执行顺序、模块职责、形状与缓存 | [ARCHITECTURE.md](ARCHITECTURE.md) |
 | 矩阵/透明度集中上传、uint8 背景上传与性能证据 | [UPLOAD_OPTIMIZATION_REVIEW.md](UPLOAD_OPTIMIZATION_REVIEW.md) |
+| 本帧素材元数据复用、CPU 参数工作区和 mask 集中上传 | [PREPARATION_OPTIMIZATION_REVIEW.md](PREPARATION_OPTIMIZATION_REVIEW.md) |
 | 统一入口、业务循环与旧接口迁移 | [RENDER_API_REVIEW.md](RENDER_API_REVIEW.md)、[paste_renderer.py](paste_renderer.py) |
 | 可运行直播 worker、帧源/sink 接入与动态阶段 | [LIVE_RENDER_EXAMPLE.md](LIVE_RENDER_EXAMPLE.md)、[live_render_example.py](live_render_example.py) |
 | perf4.5 性能、长期运行与已知限制 | [STREAMING_REVIEW.md](STREAMING_REVIEW.md) |
@@ -168,8 +172,10 @@ perf4.4 筛查覆盖 B=1/4/8/16、4/16/32 个广告位、1～3 种素材尺寸�
 | `scripts/run.ps1 backends` | `benchmark_backend_comparison.py` | 比较 batch、当前桶和隔离加载的旧桶；记录完整延迟、正确性和缓存/布局计数 |
 | `scripts/run.ps1 render-img-modes` | `benchmark_render_img_modes.py` | 用真实 NPY/BMP 输入比较 eager、dense/可分离模糊的整批与分块；完整 render_img 计时及逐像素检查，见 [模式复测](RENDER_IMG_MODE_REVIEW.md) |
 | `scripts/run.ps1 uploads` | `benchmark_upload_comparison.py` | 隔离旧源码，对比完整 B8/S16 调用，静态/动态 bbox，每计时帧逐像素检查 |
+| `scripts/run.ps1 prepare` | `benchmark_prepare_comparison.py` | 对照旧版、仅路由准备优化、仅 mask 上传优化和两项合用；平衡轮换、完整调用和逐像素检查 |
 | `scripts/run.ps1 profile-uploads` | `profile_upload_stages.py` | 分开记录 CPU 阶段、CUDA 流区间及实际 GPU kernel/传输活动；用于定位而非吞吐结论 |
 | `scripts/run.ps1 check-uploads` | `check_upload_streaming.py` | 真实样例的工作区复用、动态 B/slot、B0 恢复和旧源码周期对照 |
+| `scripts/run.ps1 check-prepare` | `check_prepare_streaming.py` | 动态路数/slot、逐帧 mask 更新、参数工作区复用、素材切换、暂停恢复与退出清理 |
 | `scripts/run.ps1 check-backends` | `check_backend_contracts.py` | 检查后端覆盖顺序、广播、布局/素材更新和输出所有权 |
 | `scripts/run.ps1 check-policy` | `test_backend_policy.py` | CPU 元数据测试，检查策略精确准入与未知输入回退 |
 | `scripts/run.ps1 compare` | `benchmark_dynamic_comparison.py` | 隔离加载旧源码对照当前完整调用；`--slots` 指定广告位数，默认 16 |

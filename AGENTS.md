@@ -2,7 +2,7 @@
 
 ## 项目与运行
 
-- VirtualAds 是 Python GPU 库和命令行基准，没有 Web 服务。当前版本 `2026-10-22-perf4.8-uploads`，三参数接口说明见 `RENDER_IMG.md`；上传优化基线 `b82f35b` 和验收见 `UPLOAD_OPTIMIZATION_REVIEW.md`。旧统一入口迁移基线 `4b2b311` 和验收见 `RENDER_API_REVIEW.md`。原包 perf4.1 基线为 `0b97beb`；最初 perf4 为 `480fad5`。保持 batch 默认与 auto 表；perf4.7 新增 mask 羽化会改变遮挡边缘过渡。
+- VirtualAds 是 Python GPU 库和命令行基准，没有 Web 服务。当前版本 `2026-10-23-perf4.9-prepare`，准备阶段优化基线 `6cebfce` 和验收见 `PREPARATION_OPTIMIZATION_REVIEW.md`。三参数接口说明见 `RENDER_IMG.md`；上传优化基线 `b82f35b` 和验收见 `UPLOAD_OPTIMIZATION_REVIEW.md`。旧统一入口迁移基线 `4b2b311` 和验收见 `RENDER_API_REVIEW.md`。原包 perf4.1 基线为 `0b97beb`；最初 perf4 为 `480fad5`。保持 batch 默认与 auto 表；perf4.7 新增 mask 羽化会改变遮挡边缘过渡。
 - 先尊重调用方的 `PASTE_GPU_PYTHON`；未设置时使用 `scripts/run.ps1` 的默认解释器，即仓库父目录下 `env\paste_gpu_performance\Scripts\python.exe`。不要在新机器上硬编码旧 E 盘路径；不要直接用系统 Python 运行项目，也不要改动其他项目环境。若环境不存在，按 README 创建。
 - 当前 Windows 锁文件要求现有 Python 3.12 与 uv。`scripts/setup.ps1 -PythonPath ... -UvPath ...` 创建项目环境并安装 `requirements-lock.txt`，不会下载/安装 Python 或 uv；torch 独立使用官方 cu128 源。自定义 `-EnvironmentPath` 后相应设置 `PASTE_GPU_PYTHON`。依赖调整应同步锁文件并验证 CUDA / Triton 兼容。
 - 本机已测参考：Windows、RTX 4090、Python 3.12.14、PyTorch 2.9.1+cu128；当时解释器为 `E:\dev\virtualAds\env\paste_gpu_performance\Scripts\python.exe`。此路径是历史记录，不是所有克隆的固定入口。
@@ -36,6 +36,9 @@
 - builder / adapter 在 worker 内初始化后复用，调用方在同一计算流上串行使用；不每帧重建或清缓存。分块路径内部使用专属复制流，事件连接计算与复制；返回及异常退出前等待复制完成，禁止覆写在途GPU源或调用方持有的CPU结果。
 - `paste_upload_buffer.PinnedUploadBuffer` 只复用有界存储，所有参数逐帧重写。固定页 host 重写前须等待其上次 H2D 事件；借用 GPU 视图只在同计算流排队消费，不能暴露为持久结果。矩阵/透明度各最多 1 MiB host + 1 MiB device；背景最多 32 MiB host + 32 MiB device uint8 和 128 MiB device float32，均按实际需求延迟分配。超预算是临时工作集，不得称其仍在缓存预算内。release 必须清所有上传持有；Gaussian clear_cache 单独不清矩阵工作区。
 - `scripts/run.ps1 uploads` 对比隔离旧源码的完整 `render_img`；`profile-uploads` 的 CPU/CUDA 及父子阶段不可相加。`check-uploads` 用真实输入做固定与动态 B/S 长测，记录旧输出、H2D 工作区增长/复用和释放；不可把进程 reserved 或有界业务队列当作库泄漏。
+- `paste_route_preparation.py` 的普通 CPU 工作区最多保留 1 MiB；只在标准三参数内部路径借用，公共 route plan 独立。素材描述只在本次调用传递，不跨帧缓存；shape/dtype/device 快照与 layout 必须同时获取。源状态或 options 变化回退原扫描；异构声明尺寸保守回退；共享业务回调安装自定义入口后须将已借用参数复制成独立快照，不能重读源重新规划。保留自定义 warp 回调后的输入保护。
+- mask 集中上传工作区默认最多保留 32 MiB host + 32 MiB device，按可见 patch 总面积延迟分配，另列 `cache_info()['patch_upload']`。mask 数值逐帧验证/重写；GPU/混合来源与 negative/conjugate Tensor 逻辑视图沿用旧路径，不能因改复制顺序改变旧结果。超预算临时 host 在后续空帧/fallback/释放时也必须结束持有。
+- `scripts/run.ps1 prepare` 分开比较 baseline/route_only/mask_only/both，私有开关仅供诊断；正式轮次须平衡且验证实际工作区计数。`check-prepare` 在真实输入长测中额外更新 mask 并记录普通 CPU 参数空间；逐像素对照范围与持续帧数要分开报告。`test_prepare_cuda` 需显式 `PASTE_TEST_DEVICE=cuda:0`，对照目录默认 `results/baseline_prepare_6cebfce`，可用 `PASTE_PREPARE_BASELINE` 指定。
 - 更新 `RENDERER_VERSION` 时同步 `benchmark_shared_paste.BENCHMARK_VERSION` 和 `benchmark_paste_gpu_batch` 的两个版本常量；旧脚本会因 bundle 版本不匹配拒绝运行，不得把 CLI 拒绝算作测试通过。
 - `batch_chunk_size="auto"` 只查询 `paste_execution_policy.py` 的离线实测表，未知硬件/形状/布局/B回退整批；0强制原整批，正整数手动分块。修改策略必须补对应完整NumPy对照，不能以微基准推断整个流程收益。
 - perf4.4 的 108 个合成场景已检查帧中，bucketed 与 batch 全部零差异；动态 bbox 且素材与有序分组不变时不重新打包素材。但该轮完整调用性能不足以支持自动切换，默认 `batch` 和既有分块策略表保持不变，证据见 [BUCKETED_OPTIMIZATION_REVIEW.md](BUCKETED_OPTIMIZATION_REVIEW.md)。任何非零画面差异都不能因性能收益而获准切换后端。
