@@ -164,6 +164,7 @@ perf4.4 筛查覆盖 B=1/4/8/16、4/16/32 个广告位、1～3 种素材尺寸�
 | 命令 | 工具 | 用途 |
 |---|---|---|
 | `scripts/run.ps1 backends` | `benchmark_backend_comparison.py` | 比较 batch、当前桶和隔离加载的旧桶；记录完整延迟、正确性和缓存/布局计数 |
+| `scripts/run.ps1 render-img-modes` | `benchmark_render_img_modes.py` | 用真实 NPY/BMP 输入比较 eager、dense/可分离模糊的整批与分块；完整 render_img 计时及逐像素检查，见 [模式复测](RENDER_IMG_MODE_REVIEW.md) |
 | `scripts/run.ps1 check-backends` | `check_backend_contracts.py` | 检查后端覆盖顺序、广播、布局/素材更新和输出所有权 |
 | `scripts/run.ps1 check-policy` | `test_backend_policy.py` | CPU 元数据测试，检查策略精确准入与未知输入回退 |
 | `scripts/run.ps1 compare` | `benchmark_dynamic_comparison.py` | 隔离加载旧源码对照当前完整调用；`--slots` 指定广告位数，默认 16 |

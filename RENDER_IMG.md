@@ -21,6 +21,8 @@ with ImageRenderer(owner, options, device="cuda:0") as renderer:
 
 `frame_source`、`sink` 和 `owner` 由业务提供；上述是接线示例，不启动解码、编码或网络发送。一个 renderer/owner 对应一个串行 worker 和一个 GPU 计算流。`owner` 的三个既有方法必须为 callable：`compute_camera_motion_rate`、`motion_rate_to_sigma`、`create_gaussian_kernel`。默认 dense 模糊；只有实际业务核已验证可分离时才设置 `use_separable=True`。
 
+核的可分离检查不保证最终 uint8 与 dense 逐像素一致。若业务要求保留现有画面，切换前还须使用真实输入做完整 NumPy 对照；`3336` 真实样例的模式性能与像素验证见 [模式复测报告](RENDER_IMG_MODE_REVIEW.md)。auto 只选择分块配置，不代替这项验收，也不自动更改 `use_separable`。
+
 ## data_dict 到渲染输入
 
 | 数据 | 读取规则 |
