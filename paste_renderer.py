@@ -18,24 +18,24 @@ if __package__:
         RENDERER_VERSION as RENDERER_VERSION,
         RenderExecutor as RenderExecutor,
         RenderOptions as RenderOptions,
-        _as_tensor,
         _image_plan,
     )
     from .paste_shared_params import SharedParameterBuilder
     from .paste_shared_mask import SharedMaskBuilder
     from .paste_route_plan import build_route_plan
+    from .paste_frame_upload import FrameUploadBuffer
 else:
     from paste_camera_filter import BoundedCameraHistory as BoundedCameraHistory
     from paste_render_executor import (
         RENDERER_VERSION as RENDERER_VERSION,
         RenderExecutor as RenderExecutor,
         RenderOptions as RenderOptions,
-        _as_tensor,
         _image_plan,
     )
     from paste_shared_params import SharedParameterBuilder
     from paste_shared_mask import SharedMaskBuilder
     from paste_route_plan import build_route_plan
+    from paste_frame_upload import FrameUploadBuffer
 
 
 def initialize_renderer(
@@ -235,6 +235,7 @@ class ImageRenderer:
         self.device = SharedParameterBuilder._device(device)
         self.history = BoundedCameraHistory(capacity=history_capacity)
         self.mask_builder = SharedMaskBuilder(sigma=mask_sigma, radius=mask_radius)
+        self._frame_upload = FrameUploadBuffer()
         # The mask is built here in normalized HW form, irrespective of legacy
         # external mask conventions. Image/alpha/sampling options stay intact.
         options = replace(
@@ -315,7 +316,7 @@ class ImageRenderer:
         if has_ads:
             # Upload/convert the original background once even when routes need
             # multiple layout groups. Executors then reuse this float32 tensor.
-            shared_frame = _as_tensor(frame, self.device)
+            shared_frame = self._frame_upload.prepare(frame, self.device)
             mask = self.mask_builder.build(
                 data_dict.get("mask_coor_list", []),
                 height=height,
@@ -325,6 +326,10 @@ class ImageRenderer:
             shared = _prepare_shared_parameters(
                 self.owner, frame, camera, frame_id, mask, device=self.device
             )
+        else:
+            # Background-only rendering keeps its original CPU/GPU path and
+            # no longer needs the previous advertising frame's upload workspace.
+            self._frame_upload.release_resources()
 
         # Most traffic has one compatible layout and returns the executor's
         # original independent output directly. Mixed layouts need one final
@@ -369,9 +374,12 @@ class ImageRenderer:
             try:
                 self.mask_builder.release_resources()
             finally:
-                self.owner.imgs_raw_groups = []
-                self._active = False
-                self.last_execution = ()
+                try:
+                    self._frame_upload.release_resources()
+                finally:
+                    self.owner.imgs_raw_groups = []
+                    self._active = False
+                    self.last_execution = ()
 
     def reset_history(self):
         """Call at a seek/new camera stream before restarting frame IDs."""

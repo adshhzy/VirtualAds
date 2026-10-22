@@ -105,6 +105,7 @@ from numbers import Real
 from time import perf_counter
 from typing import Callable
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -120,6 +121,7 @@ if __package__:
     )
     from . import paste_execution_policy as execution_policy
     from .paste_shared_types import MotionKernelSpec
+    from .paste_upload_buffer import PinnedUploadBuffer
 else:
     from paste_gpu_batch import (
         homography_roi_grid,
@@ -132,6 +134,7 @@ else:
     )
     import paste_execution_policy as execution_policy
     from paste_shared_types import MotionKernelSpec
+    from paste_upload_buffer import PinnedUploadBuffer
 
 if __package__:
     from .paste_asset_cache import SizeAssetCache as _SizeAssetCache, tensor_bytes
@@ -139,7 +142,7 @@ else:
     from paste_asset_cache import SizeAssetCache as _SizeAssetCache, tensor_bytes
 
 
-RENDERER_VERSION = "2026-10-22-perf4.7-render-img"
+RENDERER_VERSION = "2026-10-22-perf4.8-uploads"
 
 
 @dataclass(frozen=True)
@@ -482,6 +485,7 @@ class RenderExecutor:
         self._map_plans = OrderedDict()  # Bounded CPU metadata only; never retains map values.
         self._host_events = {}  # 只复用完成事件；不复用仍由调用者持有的输出
         self._chunk_transfers = {}  # 每设备一个内部复制流和可复用的生产完成事件
+        self._opacity_upload = PinnedUploadBuffer()
         self._call_count = 0
         self.last_profile = None
         self.last_execution = None
@@ -497,6 +501,7 @@ class RenderExecutor:
         """
         for copy_stream, _ in self._chunk_transfers.values():
             copy_stream.synchronize()
+        self._opacity_upload.release_resources()
         self.invalidate_assets()
         self._layout_key = self._layout = None
         self._scalar_maps.clear()
@@ -534,6 +539,7 @@ class RenderExecutor:
             current_bytes=sum(tensor_bytes(value) for value in current.values()),
             bucket_bytes=sum(tensor_bytes(value) for value in buckets.values()),
             retained_stack_bytes=sum(tensor_bytes(value) for value in retained.values()),
+            opacity_upload=self._opacity_upload.cache_info(),
         )
 
     def profile_summary(self, reset=False):
@@ -1019,7 +1025,7 @@ class RenderExecutor:
                 self.invalidate_assets()
                 raise
 
-        grids, opacity = [], []
+        grids = []
         for slot_index, (param, box, ad) in enumerate(zip(params, boxes, ads)):
             x1, y1, x2, y2 = box
             roi_hw = (y2 - y1, x2 - x1)
@@ -1052,19 +1058,72 @@ class RenderExecutor:
             grids.append(
                 self._grid(grid_value, roi_hw, batch, device, f"warp grid slot {slot_index}")
             )
-            opacity.append(
-                self._map(
+        opacity = self._prepare_opacity_maps(params, boxes, device, batch, opt)
+        return grids, opacity
+
+    def _prepare_opacity_maps(self, params, boxes, device, batch, opt):
+        """Upload mutable host float32 scalars/vectors once for the entire group.
+
+        These are live values, not a value cache. The route planner produces one
+        float32 [B] vector per slot. Pack those into a bounded pinned workspace;
+        GPU views keep the original singleton/B broadcast shapes. Other dtypes,
+        spatial maps and device tensors retain the existing conversion path.
+        Immutable Python numbers continue to use the small scalar-value cache.
+        """
+        host_values = []
+        total = 0
+        if device.type == "cuda":
+            for slot, param in enumerate(params):
+                value = param.get("transparency", 1.0)
+                if isinstance(value, torch.Tensor):
+                    if (
+                        value.device.type != "cpu"
+                        or value.dtype != torch.float32
+                        or value.layout != torch.strided
+                        or value.is_neg()
+                        or value.is_conj()
+                        or value.ndim > 1
+                    ):
+                        continue
+                    value = value.detach().numpy()
+                if (
+                    isinstance(value, np.ndarray)
+                    and value.dtype == np.float32
+                    and (value.ndim == 0 or (value.ndim == 1 and value.size in (1, batch)))
+                ):
+                    host_values.append((slot, value, total))
+                    total += value.size
+
+        packed_maps = {}
+        if host_values:
+            host = self._opacity_upload.prepare((total,), dtype=torch.float32, device=device)
+            array = host.numpy()
+            for _, value, start in host_values:
+                np.copyto(array[start : start + value.size], value.reshape(-1))
+            packed = self._opacity_upload.upload()
+            # Keep scale arithmetic on the GPU, after float32 conversion, exactly
+            # as in _map. Scaling the host values could change rounding.
+            if opt.transparency_scale != 1.0:
+                packed.div_(opt.transparency_scale)
+            for slot, value, start in host_values:
+                packed_maps[slot] = packed[start : start + value.size].view(-1, 1, 1, 1)
+
+        maps = []
+        for slot, (param, (x1, y1, x2, y2)) in enumerate(zip(params, boxes)):
+            value = packed_maps.get(slot)
+            if value is None:
+                value = self._map(
                     param.get("transparency", 1.0),
                     batch,
-                    roi_hw,
+                    (y2 - y1, x2 - x1),
                     (1,),
                     opt.transparency_layout,
                     opt.transparency_scale,
                     device,
-                    f"transparency slot {slot_index}",
+                    f"transparency slot {slot}",
                 )
-            )
-        return grids, opacity
+            maps.append(value)
+        return maps
 
     def _prepare_canvas_inputs(
         self,

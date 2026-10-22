@@ -37,7 +37,7 @@ from pathlib import Path
 import sys
 import time
 
-BENCHMARK_VERSION = "2026-10-21-perf4.6-render-api"
+BENCHMARK_VERSION = "2026-10-22-perf4.8-uploads"
 GRID_ATOL = 2e-6
 
 

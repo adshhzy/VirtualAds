@@ -69,6 +69,8 @@ mask=1 保留原画面，mask=0 允许广告显示，介于两者之间形成过
 
 底层仍走 batch 与原有 auto 表，不新增 bucketed 自动准入。auto 针对每个兼容组的 B 判断，不能把独立布局拆组后的性能等同于所有路共享布局的原基准。
 
+perf4.8 起，连续 CPU uint8 背景按字节上传后在 GPU 转 float32，各组 CPU 矩阵和 float32 标量/向量透明度分别集中上传。内部空间有界复用，当前像素/矩阵/透明度每帧重新写入；不要求调用方为几何更新增加素材 revision。其他类型、非连续图像和空间透明度仍按原逻辑处理，NumPy 输出所有权和 auto 表保持不变。完整调用、分阶段和长期检查见 [上传优化报告](UPLOAD_OPTIMIZATION_REVIEW.md)。
+
 ## 暂停、素材切换和关闭
 
 - 没有任何 `ad_params_N` 键代表 B=0：返回 `(0,H,W,3)` 的 uint8 数组，进入暂停时释放活动缓存，连续暂停不反复释放。恢复复用原对象。
@@ -76,7 +78,7 @@ mask=1 保留原画面，mask=0 允许广告显示，介于两者之间形成过
 - 活动广告帧必须提供完整相机数据；暂停或全部无广告时，若有完整相机数据也会写入历史，否则跳过记录。默认历史容量 9。
 - 替换素材图片对象会被缓存识别。同对象原地改像素，需要更新 `data_dict["imgs_raw_version"]`，或在变化时调用一次 `renderer.invalidate_assets()`。
 - `renderer.reset_history()` 清历史并释放工作集，允许新流的 frame_id 重新开始；它不替业务维护 PTS 或重置编码器。
-- `renderer.release_resources()` 释放缓存和 mask 工作区，但保留历史和可复用的执行对象；`close()` 还清理本 worker 历史和 owner 当前素材引用，可重复调用。close 后应重新初始化，不继续渲染。
+- `renderer.release_resources()` 释放缓存、mask、背景与参数上传工作区，但保留历史和可复用的执行对象；`close()` 还清理本 worker 历史和 owner 当前素材引用，可重复调用。close 后应重新初始化，不继续渲染。
 - `with` 或 `finally: renderer.close()` 负责库资源。业务仍负责关闭帧源、排空/取消有界发送队列以及释放自己的素材 bank；不要逐帧 gc/empty_cache。不要无限保留带 traceback 的异常对象。
 
 ## 验证入口

@@ -2,7 +2,7 @@
 
 ## 项目与运行
 
-- VirtualAds 是 Python GPU 库和命令行基准，没有 Web 服务。当前版本 `2026-10-22-perf4.7-render-img`，三参数接口说明见 `RENDER_IMG.md`；旧统一入口迁移基线 `4b2b311` 和验收见 `RENDER_API_REVIEW.md`。原包 perf4.1 基线为 `0b97beb`；最初 perf4 为 `480fad5`。保持 batch 默认与 auto 表；本轮新增 mask 羽化会改变遮挡边缘过渡。
+- VirtualAds 是 Python GPU 库和命令行基准，没有 Web 服务。当前版本 `2026-10-22-perf4.8-uploads`，三参数接口说明见 `RENDER_IMG.md`；上传优化基线 `b82f35b` 和验收见 `UPLOAD_OPTIMIZATION_REVIEW.md`。旧统一入口迁移基线 `4b2b311` 和验收见 `RENDER_API_REVIEW.md`。原包 perf4.1 基线为 `0b97beb`；最初 perf4 为 `480fad5`。保持 batch 默认与 auto 表；perf4.7 新增 mask 羽化会改变遮挡边缘过渡。
 - 先尊重调用方的 `PASTE_GPU_PYTHON`；未设置时使用 `scripts/run.ps1` 的默认解释器，即仓库父目录下 `env\paste_gpu_performance\Scripts\python.exe`。不要在新机器上硬编码旧 E 盘路径；不要直接用系统 Python 运行项目，也不要改动其他项目环境。若环境不存在，按 README 创建。
 - 当前 Windows 锁文件要求现有 Python 3.12 与 uv。`scripts/setup.ps1 -PythonPath ... -UvPath ...` 创建项目环境并安装 `requirements-lock.txt`，不会下载/安装 Python 或 uv；torch 独立使用官方 cu128 源。自定义 `-EnvironmentPath` 后相应设置 `PASTE_GPU_PYTHON`。依赖调整应同步锁文件并验证 CUDA / Triton 兼容。
 - 本机已测参考：Windows、RTX 4090、Python 3.12.14、PyTorch 2.9.1+cu128；当时解释器为 `E:\dev\virtualAds\env\paste_gpu_performance\Scripts\python.exe`。此路径是历史记录，不是所有克隆的固定入口。
@@ -34,6 +34,9 @@
 - `motion_rate_to_sigma`、`create_gaussian_kernel`、`compute_camera_motion_rate` 缺少生产定义。基准回调只用于合成 fixture，不得将它们冒充生产定义或在接入代码中替代业务方法。
 - Gaussian 缓存使用精确 sigma，默认最多 16 项且只保留当前 owner/回调/版本/device 上下文；配置变更需更新版本或清缓存。上下文变化应释放旧 owner 强引用。可分离路径必须验证实际二维核，不靠函数名推定可分离。
 - builder / adapter 在 worker 内初始化后复用，调用方在同一计算流上串行使用；不每帧重建或清缓存。分块路径内部使用专属复制流，事件连接计算与复制；返回及异常退出前等待复制完成，禁止覆写在途GPU源或调用方持有的CPU结果。
+- `paste_upload_buffer.PinnedUploadBuffer` 只复用有界存储，所有参数逐帧重写。固定页 host 重写前须等待其上次 H2D 事件；借用 GPU 视图只在同计算流排队消费，不能暴露为持久结果。矩阵/透明度各最多 1 MiB host + 1 MiB device；背景最多 32 MiB host + 32 MiB device uint8 和 128 MiB device float32，均按实际需求延迟分配。超预算是临时工作集，不得称其仍在缓存预算内。release 必须清所有上传持有；Gaussian clear_cache 单独不清矩阵工作区。
+- `scripts/run.ps1 uploads` 对比隔离旧源码的完整 `render_img`；`profile-uploads` 的 CPU/CUDA 及父子阶段不可相加。`check-uploads` 用真实输入做固定与动态 B/S 长测，记录旧输出、H2D 工作区增长/复用和释放；不可把进程 reserved 或有界业务队列当作库泄漏。
+- 更新 `RENDERER_VERSION` 时同步 `benchmark_shared_paste.BENCHMARK_VERSION` 和 `benchmark_paste_gpu_batch` 的两个版本常量；旧脚本会因 bundle 版本不匹配拒绝运行，不得把 CLI 拒绝算作测试通过。
 - `batch_chunk_size="auto"` 只查询 `paste_execution_policy.py` 的离线实测表，未知硬件/形状/布局/B回退整批；0强制原整批，正整数手动分块。修改策略必须补对应完整NumPy对照，不能以微基准推断整个流程收益。
 - perf4.4 的 108 个合成场景已检查帧中，bucketed 与 batch 全部零差异；动态 bbox 且素材与有序分组不变时不重新打包素材。但该轮完整调用性能不足以支持自动切换，默认 `batch` 和既有分块策略表保持不变，证据见 [BUCKETED_OPTIMIZATION_REVIEW.md](BUCKETED_OPTIMIZATION_REVIEW.md)。任何非零画面差异都不能因性能收益而获准切换后端。
 - 既有新增 auto 档位仅在 B8/B16、4/16 广告位、已测源尺寸循环及 108×320 ROI 等条件内精确匹配，并沿用现有硬软件限制；不外推到 32 广告位。

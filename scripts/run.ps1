@@ -1,5 +1,5 @@
 # Deliberately not an advanced script: unknown CLI flags remain in $args.
-param([ValidateSet('shared', 'batch', 'dynamic', 'compare', 'backends', 'render-img-modes', 'tune', 'check', 'check-backends', 'check-policy', 'check-streaming', 'live-example', 'check-render-img')][string]$Benchmark = 'shared')
+param([ValidateSet('shared', 'batch', 'dynamic', 'compare', 'backends', 'render-img-modes', 'uploads', 'profile-uploads', 'check-uploads', 'tune', 'check', 'check-backends', 'check-policy', 'check-streaming', 'live-example', 'check-render-img')][string]$Benchmark = 'shared')
 
 $ErrorActionPreference = 'Stop'
 $projectPath = Split-Path -Parent $PSScriptRoot
@@ -17,6 +17,9 @@ $benchmarkFile = switch ($Benchmark) {
     'compare' { 'benchmark_dynamic_comparison.py' }
     'backends' { 'benchmark_backend_comparison.py' }
     'render-img-modes' { 'benchmark_render_img_modes.py' }
+    'uploads' { 'benchmark_upload_comparison.py' }
+    'profile-uploads' { 'profile_upload_stages.py' }
+    'check-uploads' { 'check_upload_streaming.py' }
     'tune' { 'benchmark_blur_tuning.py' }
     'check' { 'test_dynamic_batch.py' }
     'check-backends' { 'check_backend_contracts.py' }

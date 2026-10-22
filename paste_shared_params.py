@@ -43,8 +43,10 @@ import torch
 
 if __package__:
     from .paste_camera_filter import compute_camera_filter_shared
+    from .paste_upload_buffer import PinnedUploadBuffer
 else:
     from paste_camera_filter import compute_camera_filter_shared
+    from paste_upload_buffer import PinnedUploadBuffer
 
 
 def _size(value, name, *, minimum=1):
@@ -339,12 +341,14 @@ class SharedParameterBuilder:
         self.cache_kernels = cache_kernels
         self.cache_limit = _size(cache_limit, "cache_limit")
         self.kernel_cache_version = kernel_cache_version
+        self._warp_upload = PinnedUploadBuffer()
         self.clear_cache()
 
     def clear_cache(self):
         """Release Gaussian tensors and owner/callback references; reset statistics.
 
-        Does not clear caller-owned camera history or invalidate returned tensors.
+        Does not clear the reusable matrix upload workspace, caller-owned camera
+        history, or returned tensors. release_resources() also drops workspace.
         No CUDA synchronization or allocator-wide empty_cache is performed.
         """
         self._kernel_cache = OrderedDict()
@@ -355,7 +359,10 @@ class SharedParameterBuilder:
 
     def release_resources(self):
         """End this builder's stream context; the builder may be reused afterward."""
-        self.clear_cache()
+        try:
+            self._warp_upload.release_resources()
+        finally:
+            self.clear_cache()
 
     def cache_info(self):
         return {
@@ -364,6 +371,7 @@ class SharedParameterBuilder:
             "misses": self._kernel_misses,
             "limit": self.cache_limit,
             "enabled": self.cache_kernels,
+            "warp_upload": self._warp_upload.cache_info(),
         }
 
     def _grid_backend(self, *tensors):
@@ -527,7 +535,13 @@ class SharedParameterBuilder:
         return device, distortion, coefficients, motion_value, mask_canvas, None
 
     def _prepare_warp_matrices(self, raw_matrices, device):
-        """Batch ordinary CPU 3x3 matrices into one transfer; keep other inputs live."""
+        """Pack CPU [3,3]/[N,3,3] values into one CUDA transfer, without padding.
+
+        Each slot keeps its original rank and N (broadcast 1 or per-route B).
+        GPU/mixed inputs and CPU targets preserve the existing conversion path.
+        The packed CUDA views are internal borrowed inputs consumed on this
+        builder's compute stream; returned ROI grids keep their own storage.
+        """
         all_host = all(
             not isinstance(value, torch.Tensor) or value.device.type == "cpu"
             for value in raw_matrices
@@ -537,6 +551,39 @@ class SharedParameterBuilder:
             host_matrices = [
                 _host_numpy(value, f"m_inv[{index}]") for index, value in enumerate(raw_matrices)
             ]
+        if (
+            device.type == "cuda"
+            and all_host
+            and host_matrices
+            and all(
+                matrix.ndim in (2, 3)
+                and matrix.shape[-2:] == (3, 3)
+                and matrix.dtype.kind in "biuf"
+                and matrix.dtype.isnative
+                for matrix in host_matrices
+            )
+        ):
+            total = sum(matrix.size for matrix in host_matrices)
+            staging = self._warp_upload.prepare((total,), dtype=torch.float32, device=device)
+            staging_array = staging.numpy()
+            offset = 0
+            for matrix in host_matrices:
+                staging_array[offset : offset + matrix.size] = matrix.reshape(-1)
+                offset += matrix.size
+            packed = self._warp_upload.upload()
+            matrices = []
+            offset = 0
+            for matrix in host_matrices:
+                matrices.append(packed[offset : offset + matrix.size].view(matrix.shape))
+                offset += matrix.size
+            self.last_info["warp_host_matrix_batches"] = 1
+            return tuple(matrices)
+        # GPU/mixed slots on the same device can alternate with host slots; keep
+        # the bounded workspace without reading it or caching any source values.
+        # Switching the target device must not retain the previous GPU context.
+        upload_device = self._warp_upload.cache_info()["device"]
+        if device.type != "cuda" or upload_device not in (None, str(device)):
+            self._warp_upload.release_resources()
         if all_host and all(matrix.shape == (3, 3) for matrix in host_matrices):
             packed = _float_tensor(np.stack(host_matrices).astype(np.float32, copy=False), device)
             matrices = tuple(packed[index] for index in range(len(raw_matrices)))
@@ -550,8 +597,8 @@ class SharedParameterBuilder:
     def build_warp_grids(self, *, params, ads, boxes, device, batch, warp_align_corners, **kwargs):
         """Bulk adapter hook: return one current ROI grid per advertisement slot.
 
-        Source H,W come from actual collected ads, never ad_h_w. All-CPU [3,3]
-        matrices are np.stack'ed into ONE transfer, then sliced on the device.
+        Source H,W come from actual collected ads, never ad_h_w. All-CPU
+        [3,3]/[1|B,3,3] matrices share one CUDA transfer, retaining slot shapes.
         GPU matrices are used live; no geometry values or input IDs are cached.
         Repeated slot IDs remain distinct because the result is an ordered tuple.
         """
@@ -568,16 +615,20 @@ class SharedParameterBuilder:
         if not params:
             return ()
         raw_matrices = [param["m_inv"] for param in params]
+        # Reject impossible batches before allocating/uploading their payload.
+        # Tensor shape is metadata even when the tensor already lives on CUDA.
+        for index, value in enumerate(raw_matrices):
+            shape = tuple(value.shape) if hasattr(value, "shape") else np.shape(value)
+            if len(shape) not in (2, 3) or shape[-2:] != (3, 3):
+                raise ValueError(f"m_inv[{index}] must be [3,3] or [1|B,3,3]")
+            if len(shape) == 3 and shape[0] not in (1, batch):
+                raise ValueError(f"m_inv[{index}] batch must be 1 or {batch}")
         matrices = self._prepare_warp_matrices(raw_matrices, device)
         grids = []
         for i, (ad, box, matrix) in enumerate(zip(ads, boxes, matrices)):
             if not isinstance(ad, torch.Tensor) or ad.ndim != 4 or ad.shape[:2] != (batch, 4):
                 raise ValueError(f"ads[{i}] must be [B,4,H,W] with B={batch}")
             source_hw = tuple(ad.shape[-2:])
-            if matrix.ndim not in (2, 3) or matrix.shape[-2:] != (3, 3):
-                raise ValueError(f"m_inv[{i}] must be [3,3] or [1|B,3,3]")
-            if matrix.ndim == 3 and matrix.shape[0] not in (1, batch):
-                raise ValueError(f"m_inv[{i}] batch must be 1 or {batch}")
             if (
                 not isinstance(box, (tuple, list))
                 or len(box) != 4
