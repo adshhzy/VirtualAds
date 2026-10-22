@@ -1,5 +1,5 @@
 # Deliberately not an advanced script: unknown CLI flags remain in $args.
-param([ValidateSet('shared', 'batch', 'dynamic', 'compare', 'backends', 'tune', 'check', 'check-backends', 'check-policy', 'check-streaming')][string]$Benchmark = 'shared')
+param([ValidateSet('shared', 'batch', 'dynamic', 'compare', 'backends', 'tune', 'check', 'check-backends', 'check-policy', 'check-streaming', 'live-example')][string]$Benchmark = 'shared')
 
 $ErrorActionPreference = 'Stop'
 $projectPath = Split-Path -Parent $PSScriptRoot
@@ -21,6 +21,7 @@ $benchmarkFile = switch ($Benchmark) {
     'check-backends' { 'check_backend_contracts.py' }
     'check-policy' { 'test_backend_policy.py' }
     'check-streaming' { 'check_streaming_stability.py' }
+    'live-example' { 'live_render_example.py' }
 }
 $benchmarkPath = Join-Path $projectPath $benchmarkFile
 $previousTritonCache = $env:TRITON_CACHE_DIR

@@ -10,6 +10,7 @@
 - `scripts/run.ps1 backends ...` 对应 `benchmark_backend_comparison.py`；`before_bucketed` 候选配合 `--baseline` 在同进程隔离比较旧桶、当前桶和 batch，`--require-exact` 指定必须零差异的候选。`check-backends` 对应 `check_backend_contracts.py`；`check-policy` 对应 CPU 元数据测试 `test_backend_policy.py`。旧 batch 源码对照仍用 `compare` / `benchmark_dynamic_comparison.py`，`--slots` 为单个正整数，默认 16。
 - `scripts/run.ps1 check-streaming` 对应 `check_streaming_stability.py`，需要 `--baseline` 指向保留源码；`--frames` 是固定/动态两阶段合计测量帧数，不含预热。新克隆先按 README 的 `git archive`/`Expand-Archive` 步骤恢复 `6edf109`；旧桶基线为 `9c6e930`。禁止为恢复基线覆盖或删除已有 results。运行示例与内存指标边界见 `STREAMING_REVIEW.md`。
 - 新业务入口为 `paste_renderer.initialize_renderer` / `render_frame` / `release_renderer`；`paste_render_executor.py` 的 `RenderOptions` / `RenderExecutor` 是规范实现。`paste_gpu_batch_adapter.py` 只保留旧导入/函数兼容，勿再复制一份执行逻辑。共享参数在 `paste_shared_params.py` / `paste_camera_filter.py`，纯 Tensor 路由在 `paste_gpu_batch.py`，GPU 内核在 `paste_*_kernels.py`。
+- 可运行业务循环在 `live_render_example.py`，演示源/合成回调/检查 sink 在 `live_render_demo.py`；`scripts/run.ps1 live-example --device cuda:0` 为小画布演示，默认 dense，可显式 `--separable` 检查已知演示核。接入字段、source/sink 生命周期见 `LIVE_RENDER_EXAMPLE.md`；不把演示 Synthetic 回调用于生产，也不把本地 sink 称为实际编码/推流。
 - `paste_asset_cache.py` 负责历史素材 stack 的预算/LRU/revision；当前素材与源身份引用由执行器持有。优先阅读 `README.md`、`ARCHITECTURE.md` 和 `RENDER_API_REVIEW.md`；`STREAMING_REVIEW.md`、`BUCKETED_OPTIMIZATION_REVIEW.md` 等为历史记录，不能重写旧结果或据旧文档扩大当前策略范围。results/logs/env/缓存不随 Git 分发；报告中的原始测试 artifact 不在新克隆内，恢复源码不能恢复旧测量数据。
 - 新克隆用已有 uv 执行 `uv.exe tool run --from ruff==0.14.1 ruff format --check .` 和 `uv.exe tool run --from ruff==0.14.1 ruff check .`。`scripts/lint.ps1` 仅适用于已有 `..\env\tools\bin\uv.exe` 的工作区，不读取 setup 的 `-UvPath`；`-Fix` 仅统一格式再检查。Ruff 0.14.1/100列/LF/Python3.9语法目标，配置在 `pyproject.toml`，工具隔离于GPU环境。保留平铺导入路径；优先按阶段职责放置 helper，不引入只为包装参数的层层对象。
 
@@ -21,6 +22,8 @@
 - owner 的 `_paste_batch_adapter` / `_shared_paste_builder` 是唯一执行器/builder 存储位，不能另增一套缓存。每帧共享准备一次，ROI 网格仍待实际素材尺寸明确后通过 builder 回调产生。无广告绕过共享准备；`ad_params_{way_id}` 的非 None 值优先。
 - 新 `render_frame` 的 `material_groups=None` / `camera_history=None` 意味着沿用 owner 已有字段；显式空组拒绝。旧动态 wrapper 的必要参数和显式 None 行为继续兼容，不可顺手改成新 API 的默认语义。
 - 初始化在 worker 内调用一次；退出用 `release_renderer(owner)`，释放后原实例仍可重用。真实业务回调、独立 NumPy、调用方历史及有界输出队列的所有权保持不变。
+- 直播示例中 B=0 是调度暂停，无广告是 B 张背景返回；连续暂停只在进入暂停时释放，恢复复用实例。换流/seek 显式清历史并重置帧号，PTS 按下游时间线管理；同步 sink 在 close 返回前完成消费。异步 sink 必须限制队列并在退出时排空/取消，单路 NumPy view 仍可能保留整个批次存储。
+- `run_live_worker` 的 source→sink→renderer→worker 输入清理顺序、初始化失败/close异常时的后续清理须保持。sink 调用异常时用 finally 删除 worker 的 output 引用；异常 traceback 仍可持有 sink 参数或源帧，不能把清理单测解释为所有外部引用释放，上层也不能无界保存异常对象。
 - 默认保持 `normalization="legacy"`、`camera_index_policy="legacy"`；性能修改不要同时混入 `matched` / `corrected` 的画面行为变更。
 - 默认 NumPy `uint8`：B1 为 HWC、多组为 BHWC；显式 `squeeze_single=False` 保留 B1 维。固定页输出必须独立，不得被下一帧覆盖。
 - K、畸变系数、单应矩阵可能原地更新；不能仅按 frame_id 缓存几何结果。尺寸按实际素材 / 显式 resize 后的高宽处理。
@@ -61,6 +64,7 @@ $pythonCandidate = if ($env:PASTE_GPU_PYTHON) { $env:PASTE_GPU_PYTHON } else { J
 $projectPython = (Resolve-Path -LiteralPath $pythonCandidate -ErrorAction Stop).Path
 & $projectPython -m unittest test_streaming_history test_streaming_lifecycle test_adapter_preparation test_core_guards test_backend_policy
 & $projectPython -B -m unittest test_render_api
+& $projectPython -B -m unittest test_live_render_example
 .\scripts\run.ps1 check-streaming --device cuda:0 --entry-point render_frame --baseline results/baseline_render_api_4b2b311 --baseline-label 4b2b311 --frames 10000 --warmup 200 --sample-every 100 --check-every 250 --revision-every 1 --retain-outputs 3 --output results/render_api_streaming_final_10000.json
 ```
 

@@ -5,9 +5,11 @@ VirtualAds 是 PyTorch / Triton GPU 广告贴图库和命令行基准程序，�
 新业务统一调用 `paste_renderer.render_frame`：worker 初始化一次，每帧由入口完成共享准备与渲染，退出时统一释放。原执行实现迁至 `RenderExecutor`，旧 adapter 名称和调用方式继续兼容。本轮是接口组织调整，未修改 GPU 数学、默认 `batch` 或既有 `auto` 策略，也不宣称性能提升。
 先读 [代码阅读与修改指南](ARCHITECTURE.md) 和 [统一渲染接口说明](RENDER_API_REVIEW.md)。perf4.5 的性能/长期运行证据保留在 [直播运行报告](STREAMING_REVIEW.md)，不作为本轮新增收益。
 
-本轮 59 项单元测试及既有 GPU 回归通过；公开入口完成 10000 帧合成长测，42 次旧源码抽查画面与策略一致。完整调用均值在四个 B 档位有升有降，不据此宣称提速；采样范围、内存观察及限制见 [本轮验收记录](RENDER_API_REVIEW.md)。
+统一入口迁移验收时，59 项单元测试及既有 GPU 回归通过；公开入口完成 10000 帧合成长测，42 次旧源码抽查画面与策略一致。完整调用均值在四个 B 档位有升有降，不据此宣称提速；采样范围、内存观察及限制见 [接口验收记录](RENDER_API_REVIEW.md)。
 
 [dynamic_paste_example.py](dynamic_paste_example.py) 与 [shared_paste_example.py](shared_paste_example.py) 保留旧业务辅助函数并委托统一入口；新调用方式见下方“接入与迭代约束”。所有方式均沿用真实业务回调。
+
+需要从可运行循环开始接入时，阅读 [直播 worker 示例](LIVE_RENDER_EXAMPLE.md)。它通过 `live-example` 命令演示动态 B、素材 revision、暂停/恢复、无广告及换流清理；演示源与 sink 使用合成数据和本地检查，不包含编码或真实推流。
 
 直播接入可显式使用 `BoundedCameraHistory(capacity=9)`，按单调帧号写入独立相机记录，并给下游输出队列设置容量。素材历史 stack 默认预算为 512 MiB，当前素材工作集与桶打包存储另计，这不是进程总内存上限。worker 退出时调用 `release_renderer(owner)`，业务继续负责历史和输出队列；新入口循环示例见 [统一渲染接口说明](RENDER_API_REVIEW.md)。此前 10000 帧观察及未定根因编译异常保留在 [直播运行报告](STREAMING_REVIEW.md)。
 
@@ -22,6 +24,7 @@ VirtualAds 是 PyTorch / Triton GPU 广告贴图库和命令行基准程序，�
 | 安装、运行与基线恢复 | 本页下面的步骤 |
 | 一帧执行顺序、模块职责、形状与缓存 | [ARCHITECTURE.md](ARCHITECTURE.md) |
 | 统一入口、业务循环与旧接口迁移 | [RENDER_API_REVIEW.md](RENDER_API_REVIEW.md)、[paste_renderer.py](paste_renderer.py) |
+| 可运行直播 worker、帧源/sink 接入与动态阶段 | [LIVE_RENDER_EXAMPLE.md](LIVE_RENDER_EXAMPLE.md)、[live_render_example.py](live_render_example.py) |
 | perf4.5 性能、长期运行与已知限制 | [STREAMING_REVIEW.md](STREAMING_REVIEW.md) |
 | 兼容旧业务辅助函数 | [dynamic_paste_example.py](dynamic_paste_example.py)、[shared_paste_example.py](shared_paste_example.py) |
 | Codex / 开发者修改约束与回归 | [AGENTS.md](AGENTS.md) |
@@ -80,6 +83,18 @@ uv.exe tool run --from ruff==0.14.1 ruff check .
 ```
 
 需要自动格式化时，将第一条中的 `--check` 去掉，再执行第二条。未加入 PATH 的 uv 可用 `& '实际路径\uv.exe'` 调用。原工作区也可运行 `.\scripts\lint.ps1` 或 `.\scripts\lint.ps1 -Fix`，但该脚本固定寻找 `..\env\tools\bin\uv.exe`；它不读取 setup 的 `-UvPath` 或 `PASTE_GPU_PYTHON`。
+
+## 运行直播循环示例
+
+在仓库根目录运行小画布 GPU 演示，默认 dense 模糊：
+
+```powershell
+.\scripts\run.ps1 live-example --device cuda:0 --frames-per-phase 3 --output results/live_render_demo.json
+```
+
+追加 `--separable` 使用已验证的合成核；追加 `--snapshot-dir results/live_render_frames` 保存可选 PPM。报告文件须不存在，快照目录须新建或为空。帧源、packet、sink 和暂停/重置规则见 [LIVE_RENDER_EXAMPLE.md](LIVE_RENDER_EXAMPLE.md)。演示需要 CUDA/Triton，CPU 单测只检查生命周期；它不包含视频编码或实际网络推流。
+
+本次 dense 24 帧、separable 200 帧演示及含既有回归的 72 项单元测试通过；检查范围是合成 hash、无广告背景、路由及生命周期，具体计数和限制见示例文档。
 
 ## 运行分享页要求的基准
 
