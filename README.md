@@ -256,3 +256,5 @@ finally:
 独立 NumPy 输出由其底层 PyTorch Tensor 持有存储；调用方不再引用后，存储才可由分配器回收复用。释放 builder/adapter 不会覆盖调用方仍持有的输出，也不会清空全局分配器。CUDA `reserved` 或进程工作集暂时不下降，不能单独作为泄漏证据；同样不能仅据一个稳定快照宣称没有泄漏。
 
 原包文档中的“本地没有 CUDA GPU”描述的是打包时的环境。初次部署的 GPU 校验见 [VALIDATION.md](docs/reports/VALIDATION.md)，本轮接口迁移验收状态见 [RENDER_API_REVIEW.md](docs/reports/RENDER_API_REVIEW.md)；合成基准通过不等于完成生产视频验收。
+
+按帧处理流程和完整业务 worker 示例见 [FRAME_PIPELINE_AND_WORKER.md](docs/FRAME_PIPELINE_AND_WORKER.md)。

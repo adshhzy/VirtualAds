@@ -255,3 +255,5 @@ data_dict["imgs_raw_version"] = asset_revision
 - Ruff format/check、59 个 Python 文件的 Python 3.9 语法检查、文档 Python 代码块编译和本地链接检查通过。
 
 原始 JSON 位于本机忽略目录 `results/startup_api_20261023/`，不随仓库分发；新克隆可按本文命令生成自己的记录。本轮没有重装已有环境，也没有重新进行吞吐或生产推流验收。
+
+按实际执行顺序说明及独立 source/sink worker 示例见 [按帧流程与业务 worker](FRAME_PIPELINE_AND_WORKER.md)。
