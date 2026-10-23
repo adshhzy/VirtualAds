@@ -41,6 +41,9 @@ try {
     $otherRequirements = @($lockedRequirements | Where-Object { $_ -notmatch '^torch==' })
     & $UvPath pip install --python $venvPython --index-url 'https://pypi.org/simple' --no-deps @otherRequirements
     if ($LASTEXITCODE -ne 0) { throw "Dependency installation failed ($LASTEXITCODE)." }
+    # Register the core package and legacy import aliases without changing locked dependencies.
+    & $UvPath pip install --python $venvPython --no-deps --no-build-isolation --editable $projectPath
+    if ($LASTEXITCODE -ne 0) { throw "Project installation failed ($LASTEXITCODE)." }
     & $UvPath pip check --python $venvPython
     if ($LASTEXITCODE -ne 0) { throw "Dependency validation failed ($LASTEXITCODE)." }
     & $venvPython -c 'import torch, triton, numpy, scipy; print(torch.__version__, triton.__version__, numpy.__version__, scipy.__version__); print(torch.version.cuda, torch.cuda.is_available()); print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else None)'

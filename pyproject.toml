@@ -1,7 +1,32 @@
+[build-system]
+requires = ["setuptools>=78"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "virtualads"
+version = "0.4.9"
+description = "GPU virtual advertisement rendering with shared frame preparation"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = ["numpy", "scipy", "torch"]
+
+[tool.setuptools]
+packages = ["virtualads"]
+package-dir = { "" = "compat", "virtualads" = "virtualads" }
+py-modules = [
+    "paste_asset_cache", "paste_camera_filter", "paste_execution_policy",
+    "paste_frame_upload", "paste_gaussian_kernels", "paste_gpu_batch",
+    "paste_gpu_batch_adapter", "paste_gpu_kernels", "paste_mask_kernels",
+    "paste_render_executor", "paste_renderer", "paste_route_plan",
+    "paste_route_preparation", "paste_shared_kernels", "paste_shared_mask",
+    "paste_shared_params", "paste_shared_types", "paste_upload_buffer",
+    "shared_paste_example", "dynamic_paste_example",
+]
+
 [tool.ruff]
 target-version = "py39"
 line-length = 100
-extend-exclude = ["results"]
+extend-exclude = ["results", "build", "dist"]
 
 [tool.ruff.lint]
 select = ["E4", "E7", "E9", "F"]

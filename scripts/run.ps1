@@ -10,28 +10,27 @@ if (-not (Test-Path -LiteralPath $pythonCandidate -PathType Leaf)) {
     throw "Python was not found at $pythonCandidate. Run scripts/setup.ps1 or set PASTE_GPU_PYTHON."
 }
 $pythonPath = (Resolve-Path -LiteralPath $pythonCandidate).Path
-$benchmarkFile = switch ($Benchmark) {
-    'shared' { 'benchmark_shared_paste.py' }
-    'batch' { 'benchmark_paste_gpu_batch.py' }
-    'dynamic' { 'benchmark_dynamic_batch.py' }
-    'compare' { 'benchmark_dynamic_comparison.py' }
-    'backends' { 'benchmark_backend_comparison.py' }
-    'render-img-modes' { 'benchmark_render_img_modes.py' }
-    'uploads' { 'benchmark_upload_comparison.py' }
-    'prepare' { 'benchmark_prepare_comparison.py' }
-    'profile-uploads' { 'profile_upload_stages.py' }
-    'check-uploads' { 'check_upload_streaming.py' }
-    'check-prepare' { 'check_prepare_streaming.py' }
-    'tune' { 'benchmark_blur_tuning.py' }
-    'check' { 'test_dynamic_batch.py' }
-    'check-backends' { 'check_backend_contracts.py' }
-    'check-policy' { 'test_backend_policy.py' }
-    'check-streaming' { 'check_streaming_stability.py' }
-    'live-example' { 'live_render_example.py' }
-    'render-img-example' { 'render_img_example.py' }
-    'check-render-img' { 'check_render_img.py' }
+$benchmarkModule = switch ($Benchmark) {
+    'shared' { 'benchmarks.benchmark_shared_paste' }
+    'batch' { 'benchmarks.benchmark_paste_gpu_batch' }
+    'dynamic' { 'benchmarks.benchmark_dynamic_batch' }
+    'compare' { 'benchmarks.benchmark_dynamic_comparison' }
+    'backends' { 'benchmarks.benchmark_backend_comparison' }
+    'render-img-modes' { 'benchmarks.benchmark_render_img_modes' }
+    'uploads' { 'benchmarks.benchmark_upload_comparison' }
+    'prepare' { 'benchmarks.benchmark_prepare_comparison' }
+    'profile-uploads' { 'tools.profile_upload_stages' }
+    'check-uploads' { 'tools.check_upload_streaming' }
+    'check-prepare' { 'tools.check_prepare_streaming' }
+    'tune' { 'benchmarks.benchmark_blur_tuning' }
+    'check' { 'tests.test_dynamic_batch' }
+    'check-backends' { 'tools.check_backend_contracts' }
+    'check-policy' { 'tests.test_backend_policy' }
+    'check-streaming' { 'tools.check_streaming_stability' }
+    'live-example' { 'examples.live_render_example' }
+    'render-img-example' { 'examples.render_img_example' }
+    'check-render-img' { 'tools.check_render_img' }
 }
-$benchmarkPath = Join-Path $projectPath $benchmarkFile
 $previousTritonCache = $env:TRITON_CACHE_DIR
 $previousTorchCache = $env:TORCHINDUCTOR_CACHE_DIR
 $exitCode = 1
@@ -39,7 +38,7 @@ Push-Location -LiteralPath $projectPath
 try {
     if (-not $env:TRITON_CACHE_DIR) { $env:TRITON_CACHE_DIR = Join-Path $environmentRoot 'cache/triton' }
     if (-not $env:TORCHINDUCTOR_CACHE_DIR) { $env:TORCHINDUCTOR_CACHE_DIR = Join-Path $environmentRoot 'cache/torchinductor' }
-    & $pythonPath -u $benchmarkPath @args
+    & $pythonPath -u -m $benchmarkModule @args
     $exitCode = $LASTEXITCODE
 } finally {
     $env:TRITON_CACHE_DIR = $previousTritonCache
